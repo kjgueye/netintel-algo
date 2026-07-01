@@ -1,0 +1,27 @@
+{
+  "name": "netintel-algo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Standalone currency-exchange service settling on Algorand via the GoPlausible x402 facilitator",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@x402-avm/avm": "2.6.1",
+    "@x402-avm/core": "2.6.1",
+    "@x402-avm/express": "2.6.1",
+    "express": "^4.21.2",
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.6.3"
+  }
+}

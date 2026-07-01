@@ -1,0 +1,16 @@
+# deps & build
+node_modules/
+dist/
+
+# local env — the real .env (with PAYTO/network) must never be committed
+.env
+.env.*
+!.env.example
+
+# logs & scratch
+*.log
+.DS_Store
+
+# original NetIntel reference handler (kept locally, not part of the standalone
+# service; superseded by src/currency-exchange.ts). Excluded from the public repo.
+/currency-exchange.ts
