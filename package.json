@@ -16,6 +16,7 @@
     "@x402-avm/avm": "2.6.1",
     "@x402-avm/core": "2.6.1",
     "@x402-avm/express": "2.6.1",
+    "@x402-avm/extensions": "2.6.1",
     "express": "^4.21.2",
     "tsx": "^4.19.2"
   },
