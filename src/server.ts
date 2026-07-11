@@ -12,6 +12,10 @@ import { domainAvailabilityRouter, DOMAIN_AVAILABILITY_PRICE } from "./domain-av
 import { messagesRouter, MESSAGES_PRICE } from "./messages.js";
 import { aiImageRouter, AI_IMAGE_PRICE } from "./ai-image.js";
 import { discoveryRouter, type DiscoveryRoute } from "./discovery.js";
+import { createStore } from "./lib/paid-call-store.js";
+import { createPaidCallLogger, buildPriceLookup } from "./lib/paid-call-logger.js";
+import { createMissStore } from "./lib/miss-log-store.js";
+import { createMissLogger } from "./lib/miss-log.js";
 
 // --- Minimal .env loader (no dependency) -----------------------------------
 // Loads KEY=VALUE lines from ./.env into process.env if not already set, so we
@@ -398,6 +402,42 @@ const app = express();
 app.set("trust proxy", true);
 app.use(express.json());
 
+// --- Paid-call analytics (passive observer; algo_* tables only) -------------
+// Records settled calls / failed paid attempts / 404 misses into the shared
+// NetIntel Postgres (DATABASE_URL) under this service's own algo_* tables —
+// never the main Base/EVM tables. Optional: without DATABASE_URL events fall
+// back to NDJSON + tagged stdout. Init failures are non-fatal (receive-only
+// resilience): the API keeps serving, writes retry lazily.
+const paidCallStore = createStore(process.env);
+const paidCallFailureStore = createStore(process.env, {
+  table: "algo_paid_call_failures",
+  fileName: "algo-paid-call-failures.ndjson",
+  stdoutTag: "ALGO_PAID_CALL_FAILURE",
+});
+const missStore = createMissStore(process.env);
+console.log(`Paid-call storage: ${paidCallStore.describe()}`);
+for (const [name, s] of [
+  ["events", paidCallStore],
+  ["failures", paidCallFailureStore],
+  ["misses", missStore],
+] as const) {
+  s.init()
+    .then(() => console.log(`[paid-call] ${name} schema ready`))
+    .catch((err) => console.error(`[paid-call] ${name} init failed (non-fatal):`, err));
+}
+
+// Registered before the payment middleware so it brackets the whole request
+// (verification + handler + settlement) and sees the PAYMENT-RESPONSE header
+// at res.finish. It observes only — payment behavior is unchanged.
+app.use(
+  createPaidCallLogger({
+    store: paidCallStore,
+    failureStore: paidCallFailureStore,
+    priceLookup: buildPriceLookup(routes),
+    network: X402_NETWORK,
+  })
+);
+
 // Free, unprotected health check (Railway). Must be registered BEFORE the
 // payment middleware doesn't matter (the middleware only guards matched routes),
 // but keeping it first makes intent obvious and avoids any payment path for it.
@@ -430,6 +470,11 @@ app.use(sentimentRouter);
 app.use(domainAvailabilityRouter);
 app.use(messagesRouter);
 app.use(aiImageRouter);
+
+// Terminal 404 handler: nothing matched — record the miss (what agents ask for
+// that we don't offer) and answer with a machine-readable 404 pointing at the
+// discovery manifest.
+app.use(createMissLogger({ store: missStore }));
 
 // Bind 0.0.0.0 explicitly so the container is reachable on Railway's network.
 app.listen(PORT, "0.0.0.0", () => {
