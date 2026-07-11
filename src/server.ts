@@ -11,6 +11,7 @@ import { sentimentRouter, SENTIMENT_PRICE } from "./sentiment.js";
 import { domainAvailabilityRouter, DOMAIN_AVAILABILITY_PRICE } from "./domain-availability.js";
 import { messagesRouter, MESSAGES_PRICE } from "./messages.js";
 import { aiImageRouter, AI_IMAGE_PRICE } from "./ai-image.js";
+import { discoveryRouter, type DiscoveryRoute } from "./discovery.js";
 
 // --- Minimal .env loader (no dependency) -----------------------------------
 // Loads KEY=VALUE lines from ./.env into process.env if not already set, so we
@@ -46,6 +47,9 @@ loadDotEnv();
 const FACILITATOR_URL = "https://facilitator.goplausible.xyz";
 const PORT = Number(process.env.PORT ?? 3000);
 const PAYTO_ADDRESS = process.env.PAYTO_ADDRESS;
+// Optional canonical origin for discovery artifacts (e.g. https://algo.netintel.dev).
+// When unset, artifacts advertise the request's own scheme + Host.
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL;
 const rawNetwork = process.env.X402_NETWORK;
 
 if (!rawNetwork) {
@@ -389,6 +393,9 @@ const routes: Record<string, RouteConfig> = {
 
 // --- App -------------------------------------------------------------------
 const app = express();
+// Behind Railway's proxy: trust X-Forwarded-Proto so req.protocol is "https"
+// and discovery artifacts advertise https URLs when PUBLIC_BASE_URL is unset.
+app.set("trust proxy", true);
 app.use(express.json());
 
 // Free, unprotected health check (Railway). Must be registered BEFORE the
@@ -397,6 +404,19 @@ app.use(express.json());
 app.get("/health", (_req, res) => {
   res.status(200).json({ status: "ok", network: X402_NETWORK });
 });
+
+// Free agent-discovery surfaces (/.well-known/x402, api-catalog, agent card,
+// apis.json, ai-plugin.json, openapi.json, llms.txt, security.txt, robots.txt,
+// / and /api on-ramps). Generated from the same `routes` object as the payment
+// middleware, so the catalogs can never drift. See src/discovery.ts.
+app.use(
+  discoveryRouter(routes as unknown as Record<string, DiscoveryRoute>, {
+    network: X402_NETWORK,
+    payTo: PAYTO_ADDRESS,
+    facilitatorUrl: FACILITATOR_URL,
+    publicBaseUrl: PUBLIC_BASE_URL,
+  })
+);
 
 // Payment gate: only requests matching `routes` require payment; everything
 // else (incl. /health) passes straight through to the next handler.
