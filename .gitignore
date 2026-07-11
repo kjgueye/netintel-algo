@@ -11,10 +11,13 @@ dist/
 *.log
 .DS_Store
 
-# throwaway local tooling — key derivation + one-time payers. Never commit these
-# (they touch mnemonics/keys and are not part of the deployed service).
-# scripts/sync-from-netintel.ts is deliberately NOT ignored: it handles no keys
-# and is how src/routes + src/utils are kept in step with the NetIntel repo.
+# throwaway local tooling — key derivation + ad-hoc payer. Never commit these
+# (they exist to poke at mnemonics/HD paths and are not part of the service).
 scripts/hd-scan.ts
 scripts/pay-test.ts
-scripts/seed-all.ts
+
+# NOT ignored, and deliberately so — neither holds key material (the mnemonic is
+# read from the MNEMONIC env var at run time; the only baked-in constant is the
+# PUBLIC payout address, which every 402 response already advertises):
+#   scripts/sync-from-netintel.ts — keeps src/routes + src/utils in step with NetIntel
+#   scripts/seed-all.ts           — catalogs endpoints into the GoPlausible index
