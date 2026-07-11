@@ -1,16 +1,17 @@
 {
   "name": "netintel-algo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Standalone currency-exchange service settling on Algorand via the GoPlausible x402 facilitator",
+  "description": "NetIntel's pay-per-call API surface settling on Algorand via the GoPlausible x402 facilitator",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "dev": "tsx watch src/server.ts",
-    "start": "tsx src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "sync:from-netintel": "tsx scripts/sync-from-netintel.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",
@@ -20,13 +21,15 @@
     "@x402-avm/extensions": "2.6.1",
     "dns2": "^2.1.0",
     "express": "^4.21.2",
+    "ip-address": "^10.2.0",
+    "pdf-parse": "^1.1.4",
     "pg": "^8.22.0",
     "tsx": "^4.19.2"
   },
   "devDependencies": {
     "@types/express": "^4.17.21",
-    "@types/node": "^20.14.0",
+    "@types/node": "^22.20.1",
     "@types/pg": "^8.20.0",
-    "typescript": "^5.6.3"
+    "typescript": "^5.9.3"
   }
 }

@@ -3,11 +3,15 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2022"],
-    "types": ["node"],
+    // Deliberately mirrors NetIntel's tsconfig. src/routes and src/utils are
+    // byte-identical copies of NetIntel's, so this repo must compile them under
+    // the same settings or `npm run sync:from-netintel` stops being viable:
+    //   - no noUncheckedIndexedAccess / noImplicitOverride (upstream omits them)
+    //   - no explicit "lib": the default for target ES2022 pulls in DOM, whose
+    //     Body.json() is Promise<any>. Pinning lib to ["ES2022"] drops DOM, and
+    //     fetch().json() degrades to Promise<unknown> — which breaks the copied
+    //     routes (github-intel and friends) on every property access.
     "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
@@ -18,5 +22,5 @@
     "rootDir": "src"
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["node_modules", "dist", "_reference-currency-exchange.ts", "currency-exchange.ts"]
+  "exclude": ["node_modules", "dist"]
 }

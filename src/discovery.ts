@@ -17,7 +17,7 @@
  */
 
 import { Router, type Request } from "express";
-import { resolveBaseUrl } from "./lib/base-url.js";
+import { resolveBaseUrl } from "./base-url.js";
 import { buildOpenApiSpec } from "./openapi.js";
 
 // Structural view of the RouteConfig entries in server.ts — enough to read
@@ -45,13 +45,100 @@ export interface DiscoveryOptions {
 }
 
 const NAME = "NetIntel Algo";
-const VERSION = "1.0.0";
+const VERSION = "2.0.0";
 
-const TAGLINE =
-  "Pay-per-call API for AI agents settling on Algorand — currency exchange, domain " +
-  "intelligence & availability, sentiment analysis, structured extraction, " +
-  "OpenAI-compatible chat completions, and AI image generation. Every endpoint is " +
-  "paid per call over the x402 micropayment protocol: no API keys, no signup, no subscriptions.";
+/**
+ * Capability groups, derived from the live route set rather than hand-listed.
+ *
+ * Each group claims a set of path prefixes. A group is only ever advertised if
+ * the routes object actually contains an endpoint matching it, so the catalogs
+ * cannot promise a capability this service does not serve. Adding an endpoint
+ * under an existing prefix needs no change here; adding a genuinely new family
+ * means adding one row (anything unmatched is simply not advertised).
+ */
+const CAPABILITY_GROUPS: ReadonlyArray<{
+  label: string;
+  bestFor: string;
+  prefixes: readonly string[];
+}> = [
+  {
+    label: "domain & DNS intelligence",
+    bestFor: "Domain risk reports, availability, WHOIS/RDAP, DNS, DNSSEC and typosquat checks",
+    prefixes: ["/dns", "/dnssec", "/dns-propagation", "/whois-rdap", "/domain", "/bulk-domain", "/typosquat", "/name-gen", "/tld-price"],
+  },
+  {
+    label: "IP & network intelligence",
+    bestFor: "IP geolocation, ASN/network ownership, subnet math and IP risk scoring",
+    prefixes: ["/ip-geo", "/ip-risk", "/ip-report", "/asn-lookup", "/subnet", "/cloud-fingerprint"],
+  },
+  {
+    label: "security & threat checks",
+    bestFor: "TLS/SSL posture, security headers, blacklists, breach and URL-safety checks",
+    prefixes: ["/ssl", "/security-headers", "/cert-transparency", "/ip-blacklist", "/ip-reputation", "/url-safety", "/breach-check", "/tech-fingerprint", "/jwt-inspector"],
+  },
+  {
+    label: "email intelligence",
+    bestFor: "Email deliverability, SPF/DKIM/DMARC authentication and address validation",
+    prefixes: ["/email-auth", "/email-intel", "/email-report"],
+  },
+  {
+    label: "web scraping & page metadata",
+    bestFor: "Extracting clean article text, Open Graph metadata, feeds, sitemaps and redirect chains",
+    prefixes: ["/web", "/page-extract", "/og-scraper", "/rss-parser", "/sitemap-parser", "/robots-txt", "/redirect", "/wayback"],
+  },
+  {
+    label: "structured extraction",
+    bestFor: "Turning unstructured text into JSON that conforms to your own schema",
+    prefixes: ["/schema-parse", "/extract", "/entity-extract", "/text-to-json", "/normalize", "/markdown"],
+  },
+  {
+    label: "text understanding",
+    bestFor: "Sentiment, classification, moderation, summarization, translation and language detection",
+    prefixes: ["/sentiment", "/classify", "/content-moderate", "/text-summarize", "/translate", "/lang-detect"],
+  },
+  {
+    label: "chat completions & image generation",
+    bestFor: "OpenAI-compatible chat completions and AI image assets paid per call",
+    prefixes: ["/messages", "/ai-image"],
+  },
+  {
+    label: "conversion & utilities",
+    bestFor: "Currency and unit conversion, money parsing, calendars, cron and holidays",
+    prefixes: ["/currency-exchange", "/convert", "/money", "/calendar", "/cron-parser", "/holidays", "/event-"],
+  },
+  {
+    label: "package & repo intel",
+    bestFor: "Assessing npm packages and GitHub repositories before depending on them",
+    prefixes: ["/npm-intel", "/github-intel"],
+  },
+  {
+    label: "phone & identity checks",
+    bestFor: "Phone number validation and username availability across platforms",
+    prefixes: ["/phone-intel", "/username-check"],
+  },
+];
+
+/** The capability groups actually represented in the live route set. */
+function capabilities(endpoints: Endpoint[]): typeof CAPABILITY_GROUPS {
+  return CAPABILITY_GROUPS.filter((g) =>
+    g.prefixes.some((p) => endpoints.some((e) => e.path.startsWith(p)))
+  );
+}
+
+/** Comma-joined capability labels with a trailing "and" — e.g. "a, b, and c". */
+function capabilityList(endpoints: Endpoint[]): string {
+  const labels = capabilities(endpoints).map((g) => g.label);
+  if (labels.length <= 1) return labels[0] ?? "pay-per-call utilities";
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function tagline(endpoints: Endpoint[]): string {
+  return (
+    `Pay-per-call API for AI agents settling on Algorand — ${endpoints.length} endpoints spanning ` +
+    `${capabilityList(endpoints)}. Every endpoint is paid per call over the x402 micropayment ` +
+    `protocol: no API keys, no signup, no subscriptions.`
+  );
+}
 
 const HOW_TO_CALL =
   "How to call it: make a normal HTTP request to any endpoint. With no payment you get an " +
@@ -121,7 +208,7 @@ function buildX402Manifest(baseUrl: string, endpoints: Endpoint[], opts: Discove
     // Protocol metadata
     x402Version: 2,
     name: NAME,
-    description: `${TAGLINE} ${endpoints.length} endpoints.`,
+    description: tagline(endpoints),
     version: VERSION,
     baseUrl,
     documentation: `${baseUrl}/.well-known/x402`,
@@ -162,13 +249,7 @@ function buildX402Manifest(baseUrl: string, endpoints: Endpoint[], opts: Discove
       contentType: "application/json for all responses",
       errorFormat: "{ error: string } with appropriate HTTP status codes",
       health: `${baseUrl}/health`,
-      bestFor: [
-        "AI agents needing currency conversion (fiat and crypto)",
-        "Domain risk reports and availability checks",
-        "Sentiment analysis and structured data extraction",
-        "OpenAI-compatible chat completions paid per call",
-        "AI image asset generation (icons, logos, social graphics)",
-      ],
+      bestFor: capabilities(endpoints).map((g) => g.bestFor),
     },
   };
 }
@@ -224,7 +305,7 @@ function buildAgentCard(baseUrl: string, endpoints: Endpoint[], opts: DiscoveryO
   return {
     protocolVersion: "0.3.0",
     name: NAME,
-    description: TAGLINE,
+    description: tagline(endpoints),
     url: baseUrl,
     preferredTransport: "HTTP+JSON",
     version: VERSION,
@@ -265,11 +346,11 @@ function buildApisJson(baseUrl: string, endpoints: Endpoint[]): object {
     name: NAME,
     type: "Index",
     description:
-      `Pay-per-call API for AI agents — ${endpoints.length} endpoints (currency exchange, ` +
-      `domain intelligence, sentiment, extraction, chat completions, AI images) paid per ` +
-      `call in USDC on Algorand via x402. No signup, no API keys.`,
+      `Pay-per-call API for AI agents — ${endpoints.length} endpoints spanning ` +
+      `${capabilityList(endpoints)}, paid per call in USDC on Algorand via x402. ` +
+      `No signup, no API keys.`,
     url: `${baseUrl}/apis.json`,
-    tags: ["x402", "micropayments", "algorand", "usdc", "ai-agents", "currency-exchange", "domain-intelligence"],
+    tags: ["x402", "micropayments", "algorand", "usdc", "ai-agents", "pay-per-call", "api"],
     apis: [
       {
         name: `${NAME} API`,
@@ -294,13 +375,14 @@ function buildApisJson(baseUrl: string, endpoints: Endpoint[]): object {
 
 // --- ai-plugin.json ------------------------------------------------------------
 
-function buildAiPlugin(baseUrl: string, opts: DiscoveryOptions): object {
+function buildAiPlugin(baseUrl: string, endpoints: Endpoint[], opts: DiscoveryOptions): object {
   return {
     schema_version: "v1",
     name_for_human: NAME,
     name_for_model: "netintel_algo",
     description_for_human:
-      "Currency exchange, domain intelligence, sentiment, extraction, chat completions, and AI images. Pay-per-call via x402 on Algorand.",
+      `${endpoints.length} endpoints spanning ${capabilityList(endpoints)}. ` +
+      `Pay-per-call via x402 on Algorand.`,
     description_for_model:
       "Pay-per-call utilities for agents over the x402 micropayment protocol (no API keys). " +
       "Unpaid requests return HTTP 402 with payment requirements; retry with an X-PAYMENT " +
@@ -317,7 +399,7 @@ function buildLlmsTxt(baseUrl: string, endpoints: Endpoint[], opts: DiscoveryOpt
   const out: string[] = [];
   out.push(`# ${NAME}`);
   out.push("");
-  out.push(`> ${TAGLINE}`);
+  out.push(`> ${tagline(endpoints)}`);
   out.push("");
   out.push(HOW_TO_CALL);
   out.push("");
@@ -340,7 +422,7 @@ function buildLlmsFullTxt(baseUrl: string, endpoints: Endpoint[]): string {
   const out: string[] = [];
   out.push(`# ${NAME} — full endpoint reference`);
   out.push("");
-  out.push(`> ${TAGLINE} This is the verbose catalog with call examples; the compact version is at /llms.txt.`);
+  out.push(`> ${tagline(endpoints)} This is the verbose catalog with call examples; the compact version is at /llms.txt.`);
   out.push("");
   out.push(HOW_TO_CALL);
   out.push("");
@@ -386,7 +468,7 @@ function buildDiscoveryJson(baseUrl: string, endpoints: Endpoint[], opts: Discov
   const range = priceRange(endpoints);
   return {
     name: NAME,
-    description: `${TAGLINE}`,
+    description: tagline(endpoints),
     totalEndpoints: endpoints.length,
     discovery: {
       llmsTxt: `${baseUrl}/llms.txt`,
@@ -487,7 +569,7 @@ export function discoveryRouter(routes: Record<string, DiscoveryRoute>, opts: Di
   // ai-plugin.json — the LLM-plugin discovery convention; points at the OpenAPI spec.
   router.get("/.well-known/ai-plugin.json", (req, res) => {
     res.set("Cache-Control", "public, max-age=3600");
-    res.json(buildAiPlugin(base(req), options));
+    res.json(buildAiPlugin(base(req), endpoints(), options));
   });
 
   // security.txt (RFC 9116) — security researchers and scanners probe this.

@@ -11,10 +11,10 @@ dist/
 *.log
 .DS_Store
 
-# throwaway local tooling — key derivation + one-time payer. Never commit these
+# throwaway local tooling — key derivation + one-time payers. Never commit these
 # (they touch mnemonics/keys and are not part of the deployed service).
-scripts/
-
-# original NetIntel reference handler (kept locally, not part of the standalone
-# service; superseded by src/currency-exchange.ts). Excluded from the public repo.
-/currency-exchange.ts
+# scripts/sync-from-netintel.ts is deliberately NOT ignored: it handles no keys
+# and is how src/routes + src/utils are kept in step with the NetIntel repo.
+scripts/hd-scan.ts
+scripts/pay-test.ts
+scripts/seed-all.ts

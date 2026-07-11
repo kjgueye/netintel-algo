@@ -1,0 +1,5 @@
+src/routes and src/utils are VERBATIM copies from the NetIntel (Base) repo.
+Do not hand-edit them — edits belong in src/config.ts or src/index.ts, or
+upstream in NetIntel. Regenerate with: npm run sync:from-netintel
+
+netintel-commit: a083a2d7d6d22145e7b8c3f57dbc0f054287e8e5
