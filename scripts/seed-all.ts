@@ -12,11 +12,15 @@
  *
  * Endpoints run SEQUENTIALLY so each settlement's logs are unambiguous.
  *
- * Matching note: already-listed entries are matched on METHOD + PATH, ignoring
- * the URL scheme. The first 7 endpoints were cataloged as http://algo.netintel.dev/…
- * before the service began pinning its x402 `resource` to PUBLIC_BASE_URL (https).
- * Re-seeding them would mint a SECOND https:// entry rather than update the old
- * one, so by default they are left alone. INCLUDE_LISTED=1 overrides.
+ * Dedupe is keyed on PATH ONLY (ignoring scheme, method and query), because that
+ * is how the facilitator itself dedupes: one catalog entry per resourceUrl. Two
+ * consequences, both learned the hard way and both costing real USDC to get wrong:
+ *   - /github-intel/analyze is served as GET *and* POST off one URL, so it has a
+ *     single catalog row (reported as GET). Keying on method would leave the POST
+ *     looking unseeded forever and re-pay for it on every run.
+ *   - the catalog paginates with limit/offset/total, NOT a next-link. Reading only
+ *     page 1 makes everything on later pages look unseeded — see loadAlreadyListed.
+ * INCLUDE_LISTED=1 overrides the skip.
  *
  * x402 settles only on HTTP < 400, so a handler that errors costs you nothing —
  * failed endpoints are simply reported and can be retried with ONLY=.
@@ -89,7 +93,12 @@ async function loadTargets(): Promise<SeedTarget[]> {
       ).toString();
       if (qs) url += `?${qs}`;
     } else {
-      body = input?.body ?? {};
+      // Normally a POST route declares bodyType "json" and the example lands in
+      // `body`. POST /github-intel/analyze is the exception: it shares ONE route
+      // config with its GET twin, which has no bodyType, so its example input
+      // surfaces as `queryParams`. Fall back to that — the handler accepts the
+      // same fields from a JSON body.
+      body = input?.body ?? input?.queryParams ?? {};
     }
 
     return {
@@ -106,23 +115,42 @@ async function loadTargets(): Promise<SeedTarget[]> {
 
 // --- 2. What the facilitator has already cataloged ---------------------------
 
-/** "METHOD /path" keys already listed for our host — scheme-insensitive. */
+/**
+ * "METHOD /path" keys already listed for our host — scheme-insensitive.
+ *
+ * The catalog paginates with limit/offset/total (NOT a next-link), and the page
+ * size is 50 while the catalog is well over that. Walking the offsets is
+ * therefore load-bearing: if this only read page 1, endpoints listed on a later
+ * page would look unseeded and a re-run would PAY FOR THEM AGAIN.
+ *
+ * If any page fails, we abort rather than return a partial set — a partial set
+ * silently understates what's already listed, which is exactly the double-pay
+ * failure mode.
+ */
 async function loadAlreadyListed(): Promise<Set<string>> {
   const listed = new Set<string>();
   const host = new URL(BASE).host;
-  let url: string | null = `${FACILITATOR}/discovery/resources`;
+  const limit = 100;
+  let offset = 0;
+  let total = Infinity;
 
-  for (let page = 0; url && page < 25; page++) {
-    const res: Response = await fetch(url);
+  for (let page = 0; offset < total && page < 100; page++) {
+    const url = `${FACILITATOR}/discovery/resources?limit=${limit}&offset=${offset}`;
+    const res = await fetch(url);
     if (!res.ok) {
-      console.warn(`  ⚠ facilitator catalog HTTP ${res.status} — cannot dedupe; assuming nothing is listed.`);
-      return listed;
+      throw new Error(
+        `facilitator catalog HTTP ${res.status} at offset ${offset}. Aborting: without the ` +
+          `full catalog we cannot tell what is already seeded, and re-seeding costs real USDC.`
+      );
     }
     const json = (await res.json()) as {
       items?: Array<{ resourceUrl?: string; method?: string }>;
-      pagination?: { next?: string | null; nextUrl?: string | null };
+      pagination?: { limit?: number; offset?: number; total?: number };
     };
-    for (const item of json.items ?? []) {
+    const items = json.items ?? [];
+    total = json.pagination?.total ?? items.length;
+
+    for (const item of items) {
       if (!item.resourceUrl) continue;
       let parsed: URL;
       try {
@@ -131,12 +159,21 @@ async function loadAlreadyListed(): Promise<Set<string>> {
         continue;
       }
       if (parsed.host !== host) continue; // other merchants' resources
-      // Ignore scheme (http:// vs https://) and any query string.
-      listed.add(`${(item.method ?? "GET").toUpperCase()} ${parsed.pathname}`);
+      // Key on PATH ONLY — not method, and ignoring scheme/query.
+      //
+      // The facilitator stores ONE entry per resourceUrl. /github-intel/analyze
+      // is served as both GET and POST off the same URL, so the catalog holds a
+      // single row for it (reporting method GET). Keying on "METHOD path" would
+      // leave "POST /github-intel/analyze" looking unseeded forever, and every
+      // re-run would pay for it again. Path-only keying matches how the catalog
+      // actually dedupes.
+      listed.add(parsed.pathname);
     }
-    const next = json.pagination?.next ?? json.pagination?.nextUrl ?? null;
-    url = next ? new URL(next, FACILITATOR).toString() : null;
+
+    if (items.length === 0) break; // defensive: no progress, don't spin
+    offset += items.length;
   }
+  console.log(`facilitator catalog: ${total} resources across all merchants`);
   return listed;
 }
 
@@ -286,8 +323,8 @@ async function main(): Promise<void> {
 
   const only = (process.env.ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
-  const skipped = all.filter((t) => listed.has(`${t.method} ${t.path}`));
-  let targets = all.filter((t) => !listed.has(`${t.method} ${t.path}`));
+  const skipped = all.filter((t) => listed.has(t.path));
+  let targets = all.filter((t) => !listed.has(t.path));
   if (only.length) {
     targets = targets.filter((t) => only.some((o) => t.label.startsWith(o) || t.path.startsWith(o)));
   }
