@@ -7,6 +7,10 @@ dist/
 .env.*
 !.env.example
 
+# key material — the payer's 24-word phrase, read by scripts/seed-all.ts.
+# NEVER commit. Ignored as a whole directory so no file under it can slip in.
+.secrets/
+
 # logs & scratch
 *.log
 .DS_Store

@@ -29,6 +29,7 @@
  *      INCLUDE_LISTED=1, DRY_RUN=1, ALGOD_MAINNET_URL.
  */
 import { pbkdf2Sync } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { wrapFetchWithPayment, x402Client } from "@x402-avm/fetch";
 import { registerExactAvmScheme } from "@x402-avm/avm/exact/client";
 import type { ClientAvmSigner } from "@x402-avm/avm";
@@ -141,7 +142,27 @@ async function loadAlreadyListed(): Promise<Set<string>> {
 
 // --- Signer (unchanged: ARC-52 HD, address verified before any signing) ------
 
-const mnemonic = process.env.MNEMONIC?.trim();
+/**
+ * The 24-word phrase, from MNEMONIC or (preferred) a file named by MNEMONIC_FILE.
+ *
+ * The file route exists so the phrase never has to be typed into a shell command,
+ * a CI log, or a chat transcript: write it once to a gitignored file (default
+ * .secrets/mnemonic.txt) and every later run just reads it. It is never printed —
+ * the only thing logged is the DERIVED PUBLIC address, which is checked against
+ * EXPECTED_ADDRESS before a single transaction is signed.
+ */
+function readMnemonic(): string | undefined {
+  const file = process.env.MNEMONIC_FILE ?? ".secrets/mnemonic.txt";
+  try {
+    const fromFile = readFileSync(file, "utf8").trim();
+    if (fromFile) return fromFile.replace(/\s+/g, " ");
+  } catch {
+    /* no file — fall back to the env var */
+  }
+  return process.env.MNEMONIC?.trim();
+}
+
+const mnemonic = readMnemonic();
 const passphrase = process.env.MNEMONIC_PASSPHRASE ?? "";
 const context = KeyContext.Address;
 const account = Number(process.env.HD_ACCOUNT ?? "0");
@@ -150,7 +171,11 @@ const derivationType = BIP32DerivationType.Peikert;
 
 async function buildSigner(): Promise<ClientAvmSigner> {
   if (!mnemonic || mnemonic.split(/\s+/).length !== 24) {
-    console.error("MNEMONIC env var is required (24-word BIP-39 phrase). Nothing sent.");
+    console.error(
+      "No 24-word phrase found. Nothing sent.\n" +
+        "  Preferred: write it once to .secrets/mnemonic.txt (gitignored), then just run the script.\n" +
+        "  Or:        MNEMONIC=\"...24 words...\" npx tsx scripts/seed-all.ts   (note the leading space)"
+    );
     process.exit(1);
   }
   const seed = pbkdf2Sync(
