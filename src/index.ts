@@ -5728,7 +5728,19 @@ app.use(domainVendorRiskRouter);
 // Terminal 404: nothing matched. Record the miss (what agents ask us for that we
 // don't offer — a product-discovery feed) and answer with a machine-readable 404
 // pointing at the discovery manifest.
-app.use(createMissLogger({ store: missStore }));
+app.use(
+  createMissLogger({
+    store: missStore,
+    // Paid routes + key free docs, for did_you_mean suggestions on near-miss
+    // paths (same behavior as the NetIntel Base app).
+    knownPaths: [
+      ...new Set(Object.keys(routes).map((k) => k.split(" ")[1])),
+      "/.well-known/x402",
+      "/llms.txt",
+      "/openapi.json",
+    ],
+  })
+);
 
 // Bind 0.0.0.0 explicitly so the container is reachable on Railway's network.
 app.listen(config.port, "0.0.0.0", () => {

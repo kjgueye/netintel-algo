@@ -603,5 +603,72 @@ export function discoveryRouter(routes: Record<string, DiscoveryRoute>, opts: Di
     res.json(buildDiscoveryJson(base(req), endpoints(), options));
   });
 
+  // x402 discovery-resources mirror — the single biggest miss on this host:
+  // one indexer probed all five CDP-shape variants 81× each (405 misses,
+  // daily, still active 2026-08-02) looking for a Bazaar-style resource list.
+  // Serve our slice of the catalog in that exact shape, same `routes` source
+  // as the manifest. `quality` deliberately omitted (self-reporting traffic
+  // stats would be fabrication) — same policy as the NetIntel Base app.
+  router.get(
+    [
+      "/v1/x402/discovery/resources",
+      "/v2/x402/discovery/resources",
+      "/x402/discovery/resources",
+      "/.well-known/x402/discovery/resources",
+      "/discovery/resources",
+    ],
+    (req, res) => {
+      const baseUrl = base(req);
+      const all = Object.entries(routes).map(([key, route]) => {
+        const [method, path] = key.split(" ");
+        const acceptsArr = Array.isArray(route.accepts) ? route.accepts : [route.accepts];
+        return {
+          resource: `${baseUrl}${path}`,
+          type: "http",
+          x402Version: 2,
+          accepts: acceptsArr.map((a) => ({
+            scheme: a.scheme,
+            network: a.network,
+            payTo: a.payTo,
+            price: a.price,
+          })),
+          method,
+          description: route.description,
+        };
+      });
+      const total = all.length;
+      const rawLimit = Number.parseInt(String(req.query.limit ?? ""), 10);
+      const rawOffset = Number.parseInt(String(req.query.offset ?? ""), 10);
+      const limit = Number.isFinite(rawLimit) ? Math.min(Math.max(rawLimit, 1), 100) : 20;
+      const offset = Number.isFinite(rawOffset) ? Math.max(rawOffset, 0) : 0;
+      res.set("Cache-Control", "public, max-age=300");
+      res.json({
+        items: all.slice(offset, offset + limit),
+        pagination: { limit, offset, total },
+        x402Version: 2,
+      });
+    }
+  );
+
+  // favicon — 69 crawler/monitor misses; a tiny inline SVG answers every
+  // variant (browsers accept SVG favicons; monitors just want a 200).
+  router.get(["/favicon.ico", "/favicon.png", "/favicon.svg"], (_req, res) => {
+    res.type("image/svg+xml");
+    res.set("Cache-Control", "public, max-age=604800");
+    res.send(
+      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#0E1116"/><text x="32" y="44" text-anchor="middle" font-family="Impact,sans-serif" font-size="36" fill="#22D3EE">N</text></svg>`
+    );
+  });
+
+  // sitemap.xml — 71 crawler-convention misses; minimal and honest.
+  router.get("/sitemap.xml", (req, res) => {
+    const baseUrl = base(req);
+    res.type("application/xml");
+    res.set("Cache-Control", "public, max-age=86400");
+    res.send(
+      `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n  <url><loc>${baseUrl}/</loc></url>\n</urlset>\n`
+    );
+  });
+
   return router;
 }
