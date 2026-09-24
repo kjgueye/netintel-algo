@@ -10,7 +10,7 @@ Sibling of the main NetIntel service (`netintel.dev`), which serves the same
 endpoints on Base. This is a peer resource server, not a proxy: it re-implements
 nothing and calls nothing upstream.
 
-## Architecture: three Algorand-specific files, everything else is a copy
+## Architecture: four Algorand-specific files, everything else is a copy
 
 `src/routes/*.ts` (121 files), `src/utils/*.ts` and `src/services/*.ts` are
 **byte-identical copies of NetIntel's**, as are `src/netintel-config.ts` (NetIntel's
@@ -18,13 +18,14 @@ whole config module), `src/mirror-402-body.ts`, `src/payment-headers.ts`,
 `src/head-challenge.ts` and `src/service-metadata.ts`. They are payment-agnostic —
 handler logic, pricing tables and 402-shape helpers that never name a rail.
 `src/route-table.ts` is **generated** from NetIntel's `index.ts`: the helper consts,
-the `routes` map, its post-map fixups and every router. Only three files are
+the `routes` map, its post-map fixups and every router. Only four files are
 Algorand-specific:
 
 | File | Role |
 | --- | --- |
 | `src/config.ts` | Binds `config` (payTo, network, challenge tag) to Algorand env vars and re-exports NetIntel's `pricing` / `timeouts` / `limits` / … tables verbatim. |
 | `src/accepts.ts` | The rail adapter. `paidAccepts()` / `signableAccepts()` — the same names NetIntel binds to Base + Solana — build ONE Algorand USDC option, carrying the challenge tag in `extra.tag`. |
+| `src/paywall.ts` | The human-facing 402 page browsers get (agents get JSON/header). The SDK's built-in page rounds prices to two decimals — "$0.00" for a $0.002 route — so each route renders its exact price, how to pay and the catalog/Bazaar links. |
 | `src/index.ts` | The AVM resource server: `@x402-avm/*` + GoPlausible + `registerExactAvmScheme`, the 402-shape middleware, discovery and analytics wiring. ~170 lines. |
 
 Keeping the copies verbatim is what makes upstream changes a one-command replay —
@@ -43,7 +44,7 @@ refuses loudly if Base wiring or a module this repo cannot provide would leak
 through — extend `src/accepts.ts` / `src/config.ts` or the sync's `MODULE_MAP`
 when that happens. `src/SYNCED-FROM.txt` records the NetIntel commit last
 synced. **Never hand-edit a synced or generated file** — changes belong in the
-three files above, or upstream in NetIntel.
+four files above, or upstream in NetIntel.
 
 Prices are NetIntel's, verbatim: Algorand and Base charge the same per call.
 
