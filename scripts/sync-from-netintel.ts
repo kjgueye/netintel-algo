@@ -17,8 +17,8 @@
  * table; the lift is anchored on markers and refuses (loudly) if Base wiring
  * or an unmapped module would leak through.
  *
- * Anything Algorand-specific belongs in src/config.ts, src/accepts.ts or
- * src/index.ts — or upstream in NetIntel. Never hand-edit a synced file.
+ * Anything Algorand-specific belongs in src/config.ts, src/accepts.ts,
+ * src/paywall.ts or src/index.ts — or upstream in NetIntel. Never hand-edit a synced file.
  *
  * This script only ever READS from the NetIntel repo. It never writes there.
  *

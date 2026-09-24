@@ -1,8 +1,8 @@
 /**
  * index.ts — the Algorand resource server.
  *
- * One of the three Algorand-specific source files (with config.ts and
- * accepts.ts). Everything under src/routes, src/utils and src/services is a
+ * One of the four Algorand-specific source files (with config.ts, accepts.ts
+ * and paywall.ts). Everything under src/routes, src/utils and src/services is a
  * byte-identical copy of NetIntel's (Base), and src/route-table.ts — the
  * helper consts + `routes` map + every router — is generated from NetIntel's
  * index.ts. See src/SYNCED-FROM.txt and `npm run sync:from-netintel`.
@@ -34,6 +34,7 @@ import { createMissStore } from "./miss-log-store.js";
 import { createMissLogger } from "./miss-log.js";
 import { mirror402Body } from "./mirror-402-body.js";
 import { headChallenge } from "./head-challenge.js";
+import { renderPaywall } from "./paywall.js";
 
 // Catch silent crashes
 process.on("unhandledRejection", (reason) => {
@@ -146,6 +147,16 @@ if (canonicalBase) {
 // 402 bodies (body-reading x402 clients otherwise see `{}` — the SDK answers
 // header-only; see mirror-402-body.ts). Registered BEFORE the paywall so its
 // res.json wrapper is in place when the middleware responds.
+// Human-facing 402 (browsers only; agents get JSON/header): the SDK's built-in
+// page rounds the price to two decimals — "$0.00 USDC" for a $0.002 route — so
+// every route carries its own page with the exact price (src/paywall.ts).
+for (const [key, cfg] of Object.entries(routes)) {
+  (cfg as { customPaywallHtml?: string }).customPaywallHtml = renderPaywall(
+    key,
+    cfg as Parameters<typeof renderPaywall>[1],
+    canonicalBase || `http://localhost:${config.port}`
+  );
+}
 app.use(mirror402Body);
 const paywall = paymentMiddleware(routes as Record<string, RouteConfig>, resourceServer);
 // HEAD on a paid path → the paywall's own 402 (header, no body), never the
