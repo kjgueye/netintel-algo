@@ -25,3 +25,6 @@ scripts/pay-test.ts
 # PUBLIC payout address, which every 402 response already advertises):
 #   scripts/sync-from-netintel.ts — keeps src/routes + src/utils in step with NetIntel
 #   scripts/seed-all.ts           — catalogs endpoints into the GoPlausible index
+
+# demo recordings live in GitHub Releases, never in the tree
+*.mp4
