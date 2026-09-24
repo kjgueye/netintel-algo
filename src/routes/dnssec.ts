@@ -1,6 +1,12 @@
 import { Router, type Request, type Response } from "express";
-import { queryDns, type DnsAnswer } from "../utils/dns-resolvers.js";
+import { dohQuery, type DnsAnswer, type DohResult } from "../utils/dns-resolvers.js";
 import { validateDomain, ValidationError } from "../utils/validators.js";
+
+// DNSSEC record types come over DoH (dohQuery), NOT dns2/UDP: dns2 never sets
+// the EDNS DO flag, so DS returned empty and DNSKEY truncated — every signed
+// domain graded F (2026-07-18 sweep; example.com ground truth: signed).
+// NSEC3 zones are detected via NSEC3PARAM at the apex (NSEC3 owner names are
+// hashed, so querying NSEC3 directly at the apex finds nothing by design).
 
 export const dnssecRouter = Router();
 
@@ -72,30 +78,37 @@ dnssecRouter.get("/dnssec/validate", async (req: Request, res: Response) => {
     const parts = domain.split(".");
     const tld = parts[parts.length - 1];
 
-    // Run all DNS queries concurrently
-    const [dsResult, dnskeyResult, rrsigResult, nsecResult, nsec3Result, soaResult, tldDsResult] =
-      await Promise.allSettled([
-        queryDns(domain, "DS"),
-        queryDns(domain, "DNSKEY"),
-        queryDns(domain, "RRSIG"),
-        queryDns(domain, "NSEC"),
-        queryDns(domain, "NSEC3"),
-        queryDns(domain, "SOA"),
-        queryDns(tld, "DS"),
-      ]);
+    // Run all DNS queries concurrently (dohQuery never rejects — failures
+    // collapse to empty answers).
+    const empty: DohResult = { answers: [], ad: false, rrsigCount: 0 };
+    const [dsResult, dnskeyResult, rrsigResult, nsecResult, nsec3ParamResult, tldDsResult] =
+      (await Promise.allSettled([
+        dohQuery(domain, "DS"),
+        dohQuery(domain, "DNSKEY"),
+        dohQuery(domain, "RRSIG"),
+        dohQuery(domain, "NSEC"),
+        dohQuery(domain, "NSEC3PARAM"),
+        dohQuery(tld, "DS"),
+      ])).map((r) => (r.status === "fulfilled" ? r.value : empty));
 
-    const dsAnswers = dsResult.status === "fulfilled" ? dsResult.value : [];
-    const dnskeyAnswers = dnskeyResult.status === "fulfilled" ? dnskeyResult.value : [];
-    const rrsigAnswers = rrsigResult.status === "fulfilled" ? rrsigResult.value : [];
-    const nsecAnswers = nsecResult.status === "fulfilled" ? nsecResult.value : [];
-    const nsec3Answers = nsec3Result.status === "fulfilled" ? nsec3Result.value : [];
-    const tldDsAnswers = tldDsResult.status === "fulfilled" ? tldDsResult.value : [];
+    const dsAnswers = dsResult.answers;
+    const dnskeyAnswers = dnskeyResult.answers;
+    // Some resolvers refuse a direct RRSIG qtype — the do=1 flag also makes
+    // signatures ride along with the other answers, so count both sources.
+    const rideAlongRrsigs = Math.max(dsResult.rrsigCount, dnskeyResult.rrsigCount, nsecResult.rrsigCount);
+    const rrsigCount = Math.max(rrsigResult.answers.length, rideAlongRrsigs);
+    const nsecAnswers = nsecResult.answers;
+    const nsec3ParamAnswers = nsec3ParamResult.answers;
+    const tldDsAnswers = tldDsResult.answers;
+
+    // The validating resolver's AD bit: authoritative proof the chain verifies.
+    const resolverValidated = dsResult.ad || dnskeyResult.ad || rrsigResult.ad;
 
     const dsPresent = dsAnswers.length > 0;
     const dnskeyPresent = dnskeyAnswers.length > 0;
-    const rrsigPresent = rrsigAnswers.length > 0;
+    const rrsigPresent = rrsigCount > 0;
     const nsecPresent = nsecAnswers.length > 0;
-    const nsec3Present = nsec3Answers.length > 0;
+    const nsec3Present = nsec3ParamAnswers.length > 0;
     const tldDsPresent = tldDsAnswers.length > 0;
 
     // Chain of trust assessment
@@ -110,7 +123,7 @@ dnssecRouter.get("/dnssec/validate", async (req: Request, res: Response) => {
       chainOfTrust = "none";
     }
 
-    const dnssecEnabled = dnskeyPresent && rrsigPresent;
+    const dnssecEnabled = (dnskeyPresent && rrsigPresent) || resolverValidated;
 
     // Build components
     const dsAlgorithms = extractAlgorithms(dsAnswers);
@@ -129,7 +142,7 @@ dnssecRouter.get("/dnssec/validate", async (req: Request, res: Response) => {
 
     const rrsigRecord = {
       present: rrsigPresent,
-      signatures_found: rrsigAnswers.length,
+      signatures_found: rrsigCount,
     };
 
     let nsecType: string | null = null;
@@ -152,9 +165,16 @@ dnssecRouter.get("/dnssec/validate", async (req: Request, res: Response) => {
     }
 
     if (!dnskeyPresent && !rrsigPresent && !dsPresent) {
-      // No DNSSEC at all
-      score -= 60;
-      findings.push({ rule: "no_dnssec", deduction: -60, detail: "No DNSKEY and no RRSIG — DNSSEC not configured" });
+      if (resolverValidated) {
+        // The validating resolver proved the chain (AD bit) but our record
+        // fetches came back empty — degraded visibility, NOT "no DNSSEC".
+        score -= 10;
+        findings.push({ rule: "records_unavailable", deduction: -10, detail: "Resolver validated the chain (AD bit set) but DNSSEC records could not be fetched — partial visibility" });
+      } else {
+        // No DNSSEC at all
+        score -= 60;
+        findings.push({ rule: "no_dnssec", deduction: -60, detail: "No DNSKEY and no RRSIG — DNSSEC not configured" });
+      }
     }
 
     if (dnskeyPresent && !dsPresent) {
@@ -183,6 +203,7 @@ dnssecRouter.get("/dnssec/validate", async (req: Request, res: Response) => {
     res.json({
       domain,
       dnssec_enabled: dnssecEnabled,
+      resolver_validated: resolverValidated,
       chain_of_trust: chainOfTrust,
       components: {
         ds_record: dsRecord,

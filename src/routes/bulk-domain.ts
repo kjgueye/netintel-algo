@@ -1,7 +1,8 @@
 import { Router, type Request, type Response } from "express";
-import { queryDns, RECORD_TYPES } from "../utils/dns-resolvers.js";
+import { nsPresence } from "../utils/dns-resolvers.js";
 import { checkSsrf, ValidationError } from "../utils/validators.js";
-import { timeouts } from "../config.js";
+import { timeouts, pricing } from "../config.js";
+import { signableAccepts } from "../accepts.js";
 
 export const bulkDomainRouter = Router();
 
@@ -157,23 +158,21 @@ async function checkSingleDomain(combo: Combination, bootstrap: Bootstrap): Prom
     }
   }
 
-  // Method 2: DNS NS record fallback
-  try {
-    const nsRecords = await queryDns(domain, RECORD_TYPES.NS);
-    if (nsRecords.length > 0) {
-      return {
-        domain,
-        name,
-        tld,
-        available: false,
-        status: "registered",
-        registrar: null,
-        expires_at: null,
-        days_until_expiry: null,
-      };
-    }
-  } catch {
-    // DNS also failed — treat as available
+  // Method 2: DNS NS record fallback. Only NXDOMAIN may claim "available" —
+  // SERVFAIL means a registered-but-lame domain, and with RDAP already failed
+  // an unverified claim of availability is the worse error, so anything short
+  // of NXDOMAIN reports registered.
+  if ((await nsPresence(domain)) !== "available") {
+    return {
+      domain,
+      name,
+      tld,
+      available: false,
+      status: "registered",
+      registrar: null,
+      expires_at: null,
+      days_until_expiry: null,
+    };
   }
 
   return {
@@ -188,18 +187,31 @@ async function checkSingleDomain(combo: Combination, bootstrap: Bootstrap): Prom
   };
 }
 
-// --- Route handler ---
+// --- Extracted check logic (shared with the domain-vet aggregator) ---
 
-bulkDomainRouter.post("/bulk-domain/check", async (req: Request, res: Response) => {
-  try {
-    const body = req.body ?? {};
-    const rawNames = body.names;
-    const rawTlds = body.tlds;
+/**
+ * RDAP bootstrap could not be fetched — the one failure the route reports as a
+ * 500 with its own message rather than a generic "Internal server error".
+ * A distinct class so callers (route + aggregators) can tell it apart from a
+ * ValidationError without string-matching.
+ */
+export class BulkDomainBootstrapError extends Error {
+  constructor() {
+    super("Failed to fetch RDAP bootstrap data");
+    this.name = "BulkDomainBootstrapError";
+  }
+}
 
+/**
+ * Check every name × TLD combination for availability. Validates and normalizes
+ * its inputs (throws ValidationError on bad input, BulkDomainBootstrapError when
+ * IANA's RDAP bootstrap is unreachable) and returns the same object shape the
+ * /bulk-domain/check route responds with.
+ */
+export async function runBulkDomain(rawNames: unknown, rawTlds?: unknown) {
     // Validate names presence
     if (!Array.isArray(rawNames) || rawNames.length === 0) {
-      res.status(400).json({ error: "names is required and must contain at least one name" });
-      return;
+      throw new ValidationError("names is required and must contain at least one name");
     }
 
     // Normalize + validate names
@@ -226,8 +238,7 @@ bulkDomainRouter.post("/bulk-domain/check", async (req: Request, res: Response) 
 
     // Build the full matrix of name × TLD combinations
     if (names.length * tlds.length > MAX_COMBINATIONS) {
-      res.status(400).json({ error: "Total domain combinations (names × tlds) cannot exceed 50" });
-      return;
+      throw new ValidationError("Total domain combinations (names × tlds) cannot exceed 50");
     }
 
     const combinations: Combination[] = [];
@@ -242,8 +253,7 @@ bulkDomainRouter.post("/bulk-domain/check", async (req: Request, res: Response) 
     try {
       bootstrap = await getBootstrap();
     } catch {
-      res.status(500).json({ error: "Failed to fetch RDAP bootstrap data" });
-      return;
+      throw new BulkDomainBootstrapError();
     }
 
     // Check all combinations concurrently
@@ -321,7 +331,7 @@ bulkDomainRouter.post("/bulk-domain/check", async (req: Request, res: Response) 
     score = Math.max(0, score);
     const grade = calculateGrade(score);
 
-    res.json({
+    return {
       total_checked: totalChecked,
       available_count: availableCount,
       taken_count: takenCount,
@@ -330,10 +340,36 @@ bulkDomainRouter.post("/bulk-domain/check", async (req: Request, res: Response) 
       score,
       grade,
       findings,
-    });
+    };
+}
+
+// --- Route handler ---
+
+// GET/HEAD return 402 so cold discovery probes see a payment challenge instead
+// of a 405 (GET-only crawlers listed this as dead/priceless). Same pattern as classify.
+const bulkDomainPaymentRequired = {
+  x402Version: 2,
+  accepts: signableAccepts(pricing.bulkDomain),
+  error: "Payment required",
+};
+bulkDomainRouter.get("/bulk-domain/check", (_req: Request, res: Response) => {
+  res.status(402).json(bulkDomainPaymentRequired);
+});
+bulkDomainRouter.head("/bulk-domain/check", (_req: Request, res: Response) => {
+  res.status(402).end();
+});
+
+bulkDomainRouter.post("/bulk-domain/check", async (req: Request, res: Response) => {
+  try {
+    const body = req.body ?? {};
+    res.json(await runBulkDomain(body.names, body.tlds));
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof BulkDomainBootstrapError) {
+      res.status(500).json({ error: err.message });
       return;
     }
     console.error("Bulk domain error:", err);

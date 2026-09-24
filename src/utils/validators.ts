@@ -4,19 +4,29 @@ import net from "node:net";
 const DOMAIN_RE =
   /^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*\.[A-Za-z]{2,}$/;
 
-// RFC 1918 + loopback + link-local + reserved ranges
+// RFC 1918 + loopback + link-local + reserved ranges (dotted-prefix matches;
+// ranges that don't align to an octet boundary are handled in isPrivateIPv4).
+// Documentation ranges (192.0.2/24, 198.51.100/24, 203.0.113/24) are
+// deliberately NOT here: they are unroutable, not reachable-internal, and test
+// fixtures use them as stand-in public addresses.
 const PRIVATE_RANGES_V4 = [
   { prefix: "10.", mask: 8 },
   { prefix: "127.", mask: 8 },
   { prefix: "169.254.", mask: 16 },
   { prefix: "192.168.", mask: 16 },
+  { prefix: "192.0.0.", mask: 24 }, // IETF protocol assignments (RFC 6890)
+  { prefix: "198.18.", mask: 15 }, // benchmarking (RFC 2544) — 198.18/16 + 198.19/16
+  { prefix: "198.19.", mask: 15 },
 ];
 
-function isPrivateIPv4(ip: string): boolean {
+export function isPrivateIPv4(ip: string): boolean {
   if (ip.startsWith("0.")) return true;
   for (const range of PRIVATE_RANGES_V4) {
     if (ip.startsWith(range.prefix)) return true;
   }
+  const first = parseInt(ip.split(".")[0], 10);
+  // 224.0.0.0/4 multicast + 240.0.0.0/4 reserved (incl. 255.255.255.255 broadcast)
+  if (first >= 224) return true;
   // 172.16.0.0 - 172.31.255.255
   if (ip.startsWith("172.")) {
     const second = parseInt(ip.split(".")[1], 10);
@@ -30,9 +40,28 @@ function isPrivateIPv4(ip: string): boolean {
   return false;
 }
 
-function isPrivateIPv6(ip: string): boolean {
+export function isPrivateIPv6(ip: string): boolean {
   const lower = ip.toLowerCase();
-  return lower === "::1" || lower.startsWith("fe80:") || lower.startsWith("fc") || lower.startsWith("fd");
+  // IPv4-mapped / IPv4-compatible forms embed a v4 address — judge THAT, or
+  // ::ffff:169.254.169.254 sails past every v6 prefix check below.
+  const dotted = lower.match(/^(?:::ffff:|::ffff:0:|::)(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (dotted) return isPrivateIPv4(dotted[1]);
+  const hexMapped = lower.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (hexMapped) {
+    const hi = parseInt(hexMapped[1], 16);
+    const lo = parseInt(hexMapped[2], 16);
+    return isPrivateIPv4(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
+  }
+  return (
+    lower === "::" || // unspecified
+    lower === "::1" || // loopback
+    lower.startsWith("fe80:") || // link-local
+    lower.startsWith("fec0:") || // site-local (deprecated, still routable internally)
+    lower.startsWith("fc") || // fc00::/7 unique-local
+    lower.startsWith("fd") ||
+    lower.startsWith("ff") || // ff00::/8 multicast
+    lower.startsWith("2001:db8:") // documentation
+  );
 }
 
 /**
@@ -82,8 +111,10 @@ export async function checkSsrf(hostname: string): Promise<void> {
   }
 
   for (const { address, family } of addresses) {
+    // Trust the address SHAPE over the reported family: a v4-mapped v6 answer
+    // must go through the v6 unwrap regardless of what `family` claims.
     const isPrivate =
-      family === 4 ? isPrivateIPv4(address) : isPrivateIPv6(address);
+      family === 4 && !address.includes(":") ? isPrivateIPv4(address) : isPrivateIPv6(address);
     if (isPrivate) {
       throw new ValidationError(
         "Target resolves to a private/reserved address"

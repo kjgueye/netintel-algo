@@ -31,6 +31,11 @@ export interface ImageGenResult {
   model: string;
   /** Provider key, e.g. "openai". */
   provider: string;
+  /**
+   * Provider-reported token usage (gpt-image-1 bills image output as tokens).
+   * Absent when the provider omits it — cost then logs as unknown, never 0.
+   */
+  usage?: { inputTokens: number; outputTokens: number };
 }
 
 /**
@@ -93,6 +98,10 @@ class OpenAIImageProvider implements ImageProvider {
     const timer = setTimeout(() => controller.abort(), req.timeoutMs);
 
     let res: globalThis.Response;
+    // The body (a base64 PNG — the bulk of the transfer) is read under the SAME
+    // deadline as the headers; the timer used to be cleared as soon as the headers
+    // arrived, so a body that stalled afterwards outlived req.timeoutMs.
+    let text: string;
     try {
       res = await fetch(OPENAI_IMAGES_URL, {
         method: "POST",
@@ -110,6 +119,7 @@ class OpenAIImageProvider implements ImageProvider {
         }),
         signal: controller.signal,
       });
+      text = await res.text();
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         throw new ImageProviderError("Image provider timed out", 504, true);
@@ -122,7 +132,7 @@ class OpenAIImageProvider implements ImageProvider {
     if (!res.ok) {
       let detail = "";
       try {
-        const body = (await res.json()) as { error?: { message?: string } };
+        const body = JSON.parse(text) as { error?: { message?: string } };
         detail = body?.error?.message ?? "";
       } catch {
         /* non-JSON error body — ignore */
@@ -142,8 +152,10 @@ class OpenAIImageProvider implements ImageProvider {
       throw new ImageProviderError("Image provider error", 502, true);
     }
 
-    const data = (await res.json()) as {
+    // JSON.parse throws the same SyntaxError res.json() used to on a non-JSON body.
+    const data = JSON.parse(text) as {
       data?: Array<{ url?: string; b64_json?: string; revised_prompt?: string }>;
+      usage?: { input_tokens?: number; output_tokens?: number };
     };
     const item = data?.data?.[0];
     // gpt-image-1 returns b64_json; older models may return a hosted url. Prefer
@@ -162,6 +174,9 @@ class OpenAIImageProvider implements ImageProvider {
       revisedPrompt: item?.revised_prompt,
       model: this.model,
       provider: this.name,
+      ...(typeof data?.usage?.input_tokens === "number" && typeof data?.usage?.output_tokens === "number"
+        ? { usage: { inputTokens: data.usage.input_tokens, outputTokens: data.usage.output_tokens } }
+        : {}),
     };
   }
 }

@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { queryDns, RECORD_TYPES, type DnsAnswer } from "../utils/dns-resolvers.js";
+import { nsPresence } from "../utils/dns-resolvers.js";
 import { fmtReceived, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
 
@@ -124,23 +124,12 @@ export function scoreBrandability(name: string): number {
 
 // --- Availability check (DNS NS) ---
 
-// NS records exist → domain is taken; none → available.
+// Only NXDOMAIN counts as available. NS answers, NOERROR-without-NS, and
+// SERVFAIL (a registered name with lame delegation — the normal state of
+// parked domains) are all taken; timeouts/refusals are treated as taken too,
+// so an unverified name is never claimed available.
 async function checkAvailability(domain: string): Promise<boolean> {
-  const TIMED_OUT = Symbol("timeout");
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
-    timer = setTimeout(() => resolve(TIMED_OUT), timeouts.nameGen);
-  });
-
-  try {
-    const result = await Promise.race([queryDns(domain, RECORD_TYPES.NS), timeout]);
-    if (result === TIMED_OUT) return false; // couldn't confirm — treat as taken
-    return (result as DnsAnswer[]).length === 0;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
+  return (await nsPresence(domain, timeouts.nameGen)) === "available";
 }
 
 // --- Grading ---

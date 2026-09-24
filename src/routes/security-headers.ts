@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { timeouts } from "../config.js";
 import { checkSsrf, validateUrl, ValidationError } from "../utils/validators.js";
 import { pickField } from "../utils/field-aliases.js";
+import { safeFetch, FetchProblem, type SafeFetchResult } from "../utils/safe-fetch.js";
 
 export const securityHeadersRouter = Router();
 
@@ -368,11 +369,12 @@ export async function runSecurityHeaders(target: string): Promise<SecurityHeader
   const parsedUrl = validateUrl(normalized);
   await checkSsrf(parsedUrl.hostname);
 
-  const fetchResponse = await fetch(parsedUrl.toString(), {
-    method: "GET",
-    redirect: "follow",
-    signal: AbortSignal.timeout(timeouts.securityHeaders),
+  // Every redirect hop is SSRF-checked before it is requested. Headers are the
+  // product and the body is discarded, so the read is capped small.
+  const fetchResponse = await safeFetch(parsedUrl, {
     headers: { "User-Agent": "NetIntel/1.0 security-headers-audit" },
+    timeoutMs: timeouts.securityHeaders,
+    maxBytes: 64 * 1024,
   });
 
   const headers = fetchResponse.headers;
@@ -462,15 +464,22 @@ securityHeadersRouter.get("/security-headers/analyze", async (req: Request, res:
 
     const start = Date.now();
 
-    let fetchResponse: globalThis.Response;
+    let fetchResponse: SafeFetchResult;
     try {
-      fetchResponse = await fetch(parsedUrl.toString(), {
-        method: "GET",
-        redirect: "follow",
-        signal: AbortSignal.timeout(timeouts.securityHeaders),
+      // Every redirect hop is SSRF-checked before it is requested. Headers are
+      // the product and the body is discarded, so the read is capped small.
+      fetchResponse = await safeFetch(parsedUrl, {
         headers: { "User-Agent": "NetIntel/1.0 security-headers-audit" },
+        timeoutMs: timeouts.securityHeaders,
+        maxBytes: 64 * 1024,
       });
     } catch (fetchErr) {
+      // A private/reserved redirect target → the outer ValidationError → 400.
+      if (fetchErr instanceof ValidationError) throw fetchErr;
+      if (fetchErr instanceof FetchProblem) {
+        res.status(fetchErr.status).json({ error: fetchErr.message, code: fetchErr.code });
+        return;
+      }
       const message = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
       res.status(503).json({ error: `Connection failed: ${message}` });
       return;
@@ -534,7 +543,7 @@ securityHeadersRouter.get("/security-headers/analyze", async (req: Request, res:
     if (fetchResponse.status >= 400) {
       warnings.push(`Target returned HTTP ${fetchResponse.status} — headers evaluated on error response`);
     }
-    const finalUrl = fetchResponse.url || parsedUrl.toString();
+    const finalUrl = fetchResponse.finalUrl || parsedUrl.toString();
     try {
       const finalHostname = new URL(finalUrl).hostname;
       if (finalHostname !== parsedUrl.hostname) {

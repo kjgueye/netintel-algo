@@ -2,20 +2,14 @@ import { Router, type Request, type Response } from "express";
 import { resolveTxt, domainHasMailInfra } from "../utils/dns-resolvers.js";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { config, pricing } from "../config.js";
+import { signableAccepts } from "../accepts.js";
 
 export const emailAuthRouter = Router();
 
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const emailAuthPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.emailAuth,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.emailAuth),
   error: "Payment required",
 };
 

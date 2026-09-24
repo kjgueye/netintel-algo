@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { config, pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
 
 export const entityExtractRouter = Router();
 
@@ -27,14 +28,7 @@ type EntityType = (typeof ENTITY_TYPES)[number];
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const entityExtractPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.entityExtract,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.entityExtract),
   error: "Payment required",
 };
 

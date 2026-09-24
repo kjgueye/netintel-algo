@@ -230,16 +230,21 @@ export async function runUrlSafety(rawUrl: string): Promise<UrlSafetyResult> {
     const timeout = setTimeout(() => controller.abort(), timeouts.urlSafety);
 
     const body = new URLSearchParams({ url: parsed.href });
-    const response = await fetch("https://urlhaus-api.abuse.ch/v1/url/", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-      signal: controller.signal,
-    });
-
-    clearTimeout(timeout);
-
-    const data = await response.json() as Record<string, any>;
+    // Headers AND body are read under the same deadline: the timer used to be
+    // cleared as soon as the headers arrived, so a body that stalled afterwards
+    // outlived timeouts.urlSafety.
+    let data: Record<string, any>;
+    try {
+      const response = await fetch("https://urlhaus-api.abuse.ch/v1/url/", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString(),
+        signal: controller.signal,
+      });
+      data = (await response.json()) as Record<string, any>;
+    } finally {
+      clearTimeout(timeout);
+    }
 
     if (data.query_status === "is_url") {
       inUrlhaus = true;

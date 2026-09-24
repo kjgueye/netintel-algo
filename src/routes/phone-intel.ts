@@ -250,6 +250,53 @@ function parsePhone(rawPhone: string, countryHint?: string): PhoneResult {
     return invalidResult(input, totalDigits, [{ rule: reason, deduction: -100, detail }]);
   }
 
+  // Step 3b: NANP assignment checks — shape alone isn't validity. Without
+  // these, +1 (555) 867-5309 graded A/100 (caught by the 2026-07-18 eval
+  // sweep probing with the canonical fictional number). A hit still parses
+  // and returns every format variant (this is a normalizer too) but the
+  // verdict is is_valid:false / score 0 — same contract as other invalid
+  // numbers: a "no" is a valid ANSWER, 200 and charged.
+  let nanpUnassigned: Finding | null = null;
+  let nanpSoftFlag: Finding | null = null;
+  if (country?.dialCode === "1" && nationalDigits.length === 10) {
+    const npa = nationalDigits.slice(0, 3);
+    const nxx = nationalDigits.slice(3, 6);
+    const subscriber = nationalDigits.slice(6);
+    if (npa === "555") {
+      nanpUnassigned = {
+        rule: "unassigned_area_code",
+        deduction: -100,
+        detail: "555 is not an assigned NANP area code — commonly used for fictional numbers",
+      };
+    } else if (nxx === "555" && subscriber >= "0100" && subscriber <= "0199") {
+      nanpUnassigned = {
+        rule: "fictional_number",
+        deduction: -100,
+        detail: "NXX 555-0100 through 555-0199 is the reserved fictional-number range — not assignable to subscribers",
+      };
+    } else if (nxx === "555" && subscriber === "1212") {
+      // Directory assistance — a real service number, not a subscriber line.
+      nanpSoftFlag = {
+        rule: "directory_assistance",
+        deduction: -10,
+        detail: "555-1212 is directory assistance — a real service, but not a subscriber's contact number",
+      };
+    } else if (nxx === "555" && !NANP_TOLL_FREE.has(npa)) {
+      // In GEOGRAPHIC area codes the 555 exchange is technically assignable
+      // since 1994 but has virtually no real subscribers — it is the
+      // internet's default fake number (+1 415 555 2671 graded A/100 in the
+      // 2026-08-04 eval probe). Toll-free 555 is excluded: those have real
+      // assignments (e.g. 1-800-555-TELL). Pattern-valid, so is_valid stays
+      // true; the finding carries the doubt.
+      nanpSoftFlag = {
+        rule: "likely_fictional_555",
+        deduction: -25,
+        detail:
+          "The 555 exchange has virtually no real assignments outside directory assistance — commonly used as a fictional/example number",
+      };
+    }
+  }
+
   // Step 4: Format variants
   const findings: Finding[] = [];
   let score = 100;
@@ -290,12 +337,22 @@ function parsePhone(rawPhone: string, countryHint?: string): PhoneResult {
     score -= 30;
   }
 
+  if (nanpSoftFlag) {
+    findings.push(nanpSoftFlag);
+    score += nanpSoftFlag.deduction;
+  }
+
+  if (nanpUnassigned) {
+    findings.push(nanpUnassigned);
+    score = 0;
+  }
+
   score = Math.max(0, score);
   const grade = calculateGrade(score);
 
   return {
     input,
-    is_valid: true,
+    is_valid: !nanpUnassigned,
     e164,
     international,
     national,

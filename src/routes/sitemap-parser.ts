@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
-import { validateUrl, validateDomain, checkSsrf, ValidationError } from "../utils/validators.js";
+import { validateUrl, validateDomain, ValidationError } from "../utils/validators.js";
+import { safeFetch, FetchProblem, type SafeFetchOptions } from "../utils/safe-fetch.js";
 import { timeouts } from "../config.js";
 
 export const sitemapParserRouter = Router();
@@ -24,17 +25,14 @@ interface Finding {
 
 const USER_AGENT = "Mozilla/5.0 (compatible; NetIntel/1.0)";
 
-async function safeFetch(url: string): Promise<{ status: number; text: string }> {
-  const parsed = new URL(url);
-  await checkSsrf(parsed.hostname);
-  const res = await fetch(url, {
-    headers: { "User-Agent": USER_AGENT, Accept: "application/xml, text/xml" },
-    redirect: "follow",
-    signal: AbortSignal.timeout(timeouts.sitemapParser),
-  });
-  const text = await res.text();
-  return { status: res.status, text };
-}
+// Every URL this route fetches beyond the caller's input comes from REMOTE
+// content (robots.txt Sitemap: directives, sitemap-index <loc>s), so each one
+// goes through the shared safeFetch: SSRF-checked on hop 0 AND on every
+// redirect hop before it is requested.
+const FETCH_OPTIONS: SafeFetchOptions = {
+  headers: { "User-Agent": USER_AGENT, Accept: "application/xml, text/xml" },
+  timeoutMs: timeouts.sitemapParser,
+};
 
 function extractTag(block: string, tag: string): string | null {
   const re = new RegExp(`<${tag}[^>]*>([^<]+)</${tag}>`, "i");
@@ -155,7 +153,7 @@ sitemapParserRouter.get("/sitemap-parser/fetch", async (req: Request, res: Respo
     if (isDomainInput && domain) {
       // Try robots.txt first
       try {
-        const robotsResult = await safeFetch(`https://${domain}/robots.txt`);
+        const robotsResult = await safeFetch(`https://${domain}/robots.txt`, FETCH_OPTIONS);
         if (robotsResult.status === 200) {
           const sitemaps = parseSitemapDirectivesFromRobots(robotsResult.text);
           if (sitemaps.length > 0) {
@@ -170,7 +168,7 @@ sitemapParserRouter.get("/sitemap-parser/fetch", async (req: Request, res: Respo
       if (!sitemapUrl) {
         for (const path of ["/sitemap.xml", "/sitemap_index.xml"]) {
           try {
-            const result = await safeFetch(`https://${domain}${path}`);
+            const result = await safeFetch(`https://${domain}${path}`, FETCH_OPTIONS);
             if (result.status === 200 && (result.text.includes("<urlset") || result.text.includes("<sitemapindex"))) {
               sitemapUrl = `https://${domain}${path}`;
               cachedSitemapText = result.text;
@@ -215,7 +213,7 @@ sitemapParserRouter.get("/sitemap-parser/fetch", async (req: Request, res: Respo
       sitemapText = cachedSitemapText;
     } else {
       try {
-        const result = await safeFetch(sitemapUrl!);
+        const result = await safeFetch(sitemapUrl!, FETCH_OPTIONS);
         if (result.status === 404) {
           res.status(404).json({ error: "Sitemap not found at URL" });
           return;
@@ -227,6 +225,10 @@ sitemapParserRouter.get("/sitemap-parser/fetch", async (req: Request, res: Respo
         sitemapText = result.text;
       } catch (err) {
         if (err instanceof ValidationError) throw err;
+        if (err instanceof FetchProblem) {
+          res.status(err.status).json({ error: err.message, code: err.code });
+          return;
+        }
         res.status(502).json({ error: "Failed to fetch sitemap" });
         return;
       }
@@ -273,7 +275,7 @@ sitemapParserRouter.get("/sitemap-parser/fetch", async (req: Request, res: Respo
       // Fetch up to 3 child sitemaps concurrently, 1 level only
       const toFetch = childLocs.slice(0, 3);
       const results = await Promise.allSettled(
-        toFetch.map((loc) => safeFetch(loc)),
+        toFetch.map((loc) => safeFetch(loc, FETCH_OPTIONS)),
       );
       for (const r of results) {
         if (r.status === "fulfilled" && r.value.status === 200) {

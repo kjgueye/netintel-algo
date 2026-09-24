@@ -1,5 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { validateUrl, checkSsrf, ValidationError } from "../utils/validators.js";
+import { safeFetch, FetchProblem } from "../utils/safe-fetch.js";
+import { assessSource } from "../utils/source-usability.js";
 import { timeouts } from "../config.js";
 
 export const ogScraperRouter = Router();
@@ -201,44 +203,25 @@ ogScraperRouter.get("/og-scraper/extract", async (req: Request, res: Response) =
     const maxAttempts = 2;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeouts.ogScraper);
-
-        const response = await fetch(parsed.href, {
-          method: "GET",
+        // safeFetch SSRF-checks every redirect hop before requesting it and
+        // keeps one deadline over all hops + the 200 KB body read.
+        const r = await safeFetch(parsed, {
           headers: {
             "User-Agent": "Mozilla/5.0 (compatible; NetIntel/1.0)",
             "Accept": "text/html",
           },
-          redirect: "follow",
-          signal: controller.signal,
+          timeoutMs: timeouts.ogScraper,
+          maxBytes: 200 * 1024,
         });
-
-        clearTimeout(timeout);
-
-        statusCode = response.status;
-        finalUrl = response.url || parsed.href;
-
-        // Read max 200KB
-        const reader = response.body?.getReader();
-        if (reader) {
-          const chunks: Uint8Array[] = [];
-          let totalSize = 0;
-          const maxSize = 200 * 1024;
-
-          while (totalSize < maxSize) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            totalSize += value.length;
-          }
-          reader.cancel().catch(() => {});
-
-          const decoder = new TextDecoder();
-          html = chunks.map((c) => decoder.decode(c, { stream: true })).join("");
-        }
+        statusCode = r.status;
+        finalUrl = r.finalUrl;
+        html = r.text;
         break;
       } catch (err) {
+        // A refused hop (private host, non-http scheme, too many redirects) is
+        // a verdict, not a transient failure: never retried, never the generic
+        // 500 — the outer catch maps it to its uncharged status.
+        if (err instanceof ValidationError || err instanceof FetchProblem) throw err;
         if (attempt === maxAttempts - 1) {
           const message = err instanceof Error ? err.message : String(err);
           res.status(500).json({ error: `Metadata extraction failed: ${message}` });
@@ -254,7 +237,12 @@ ogScraperRouter.get("/og-scraper/extract", async (req: Request, res: Response) =
     const title = parseTitle(html);
     const description = parseDescription(html);
     const image = parseImage(html);
-    const canonical = getCanonicalUrl(html);
+    // <link rel=canonical> first; og:url is an equally deliberate authorial
+    // canonical signal (e.g. GitHub declares og:url but no canonical link).
+    // No fallback to the fetched URL: the old `canonical ?? finalUrl` fill
+    // made responses claim a canonical URL while the no_canonical finding
+    // said none was found (2026-07-30 sweep audit) — absent now means null.
+    const canonical = getCanonicalUrl(html) ?? getMetaContent(html, "og:url");
     const favicon = getFaviconUrl(html, finalUrl);
     const siteName = parseSiteName(html, finalUrl);
     const contentType = getMetaContent(html, "og:type") ?? "website";
@@ -262,6 +250,41 @@ ogScraperRouter.get("/og-scraper/extract", async (req: Request, res: Response) =
     const publishedAt = parsePublishedAt(html, jsonLd);
     const modifiedAt = parseModifiedAt(html, jsonLd);
     const twitterCard = getMetaContent(html, "twitter:card");
+
+    // Never bill for a miss: a bot challenge, a 404, or a page with zero real
+    // metadata has nothing to sell, and a graded-down 200 would still settle the
+    // payment (x402 settles on <400). Answer 4xx instead — uncharged.
+    // Only genuinely EXTRACTED fields count as evidence; site_name, favicon and
+    // content_type all have derived/default fallbacks and would mask an empty page.
+    const extractedFields = [
+      title,
+      description,
+      image,
+      canonical,
+      author,
+      publishedAt,
+      modifiedAt,
+      twitterCard,
+      jsonLd,
+    ].filter((v) => v !== null && v !== undefined).length;
+
+    const unusable = assessSource({
+      status: statusCode,
+      title,
+      body: html,
+      contentUnits: extractedFields,
+      noun: "metadata",
+    });
+    if (unusable) {
+      res.status(unusable.status).json({
+        error: unusable.error,
+        code: unusable.code,
+        url: parsed.href,
+        final_url: finalUrl,
+        status_code: statusCode,
+      });
+      return;
+    }
 
     // Grading
     let score = 100;
@@ -320,7 +343,7 @@ ogScraperRouter.get("/og-scraper/extract", async (req: Request, res: Response) =
       image,
       favicon,
       site_name: siteName,
-      canonical_url: canonical ?? finalUrl,
+      canonical_url: canonical,
       content_type: contentType,
       author,
       published_at: publishedAt,
@@ -336,6 +359,10 @@ ogScraperRouter.get("/og-scraper/extract", async (req: Request, res: Response) =
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof FetchProblem) {
+      res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
     console.error("OG scraper error:", err);

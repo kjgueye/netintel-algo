@@ -1,5 +1,6 @@
 import { Router, type Request, type Response } from "express";
 import { validateUrl, checkSsrf, ValidationError } from "../utils/validators.js";
+import { safeFetch, FetchProblem } from "../utils/safe-fetch.js";
 import { timeouts } from "../config.js";
 
 export const rssParserRouter = Router();
@@ -203,18 +204,17 @@ rssParserRouter.get("/rss-parser/fetch", async (req: Request, res: Response) => 
       limit = parsedLimit;
     }
 
-    // Fetch the feed
-    const response = await fetch(parsed.href, {
-      method: "GET",
+    // Fetch the feed — safeFetch SSRF-checks every redirect hop before
+    // requesting it (the explicit check above covers hop 0 only).
+    const r = await safeFetch(parsed, {
       headers: {
         "User-Agent": "Mozilla/5.0 (compatible; NetIntel/1.0)",
         "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml",
       },
-      redirect: "follow",
-      signal: AbortSignal.timeout(timeouts.rssParser),
+      timeoutMs: timeouts.rssParser,
     });
 
-    const xml = await response.text();
+    const xml = r.text;
 
     // Detect format
     let score = 100;
@@ -288,6 +288,10 @@ rssParserRouter.get("/rss-parser/fetch", async (req: Request, res: Response) => 
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof FetchProblem) {
+      res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
     console.error("RSS parser error:", err);

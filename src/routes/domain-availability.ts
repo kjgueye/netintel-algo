@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { queryDns, RECORD_TYPES } from "../utils/dns-resolvers.js";
+import { nsPresence } from "../utils/dns-resolvers.js";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
 
@@ -141,22 +141,20 @@ async function checkSingleDomain(fullDomain: string, bootstrap: { services: stri
     }
   }
 
-  // Method 2: DNS NS record fallback
-  try {
-    const nsRecords = await queryDns(fullDomain, RECORD_TYPES.NS);
-    if (nsRecords.length > 0) {
-      return {
-        domain: fullDomain,
-        available: false,
-        status: "registered",
-        registrar: null,
-        expires_at: null,
-        days_until_expiry: null,
-        expiring_soon: false,
-      };
-    }
-  } catch {
-    // DNS also failed — treat as available
+  // Method 2: DNS NS record fallback. Only NXDOMAIN may claim "available" —
+  // SERVFAIL means a registered-but-lame domain, and with RDAP already failed
+  // an unverified claim of availability is the worse error, so anything short
+  // of NXDOMAIN reports registered.
+  if ((await nsPresence(fullDomain)) !== "available") {
+    return {
+      domain: fullDomain,
+      available: false,
+      status: "registered",
+      registrar: null,
+      expires_at: null,
+      days_until_expiry: null,
+      expiring_soon: false,
+    };
   }
 
   return {

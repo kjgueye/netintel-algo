@@ -1,10 +1,11 @@
 import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
-import Anthropic from "@anthropic-ai/sdk";
-import { config, pricing, timeouts } from "../config.js";
+import { pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { pickField } from "../utils/field-aliases.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
+import { openaiJsonComplete, OpenAiCallError } from "../services/openai-json.js";
 
 export const extractTableRouter = Router();
 
@@ -25,6 +26,11 @@ const MAX_BYTES = 50 * 1024;
 // big table blows the budget we return TRUNCATED_OUTPUT so the agent can split
 // the input, rather than silently dropping rows.
 const MAX_TOKENS = 2048;
+
+// Swapped from Anthropic Haiku to gpt-4o-mini 2026-09-02 (see the pricing
+// deep-dive / src/services/openai-json.ts); the shared helper self-manages the
+// wall-clock timeout and aborts the upstream request.
+const MODEL = "gpt-4o-mini";
 
 const SERVICE_SLUG = "extract-table";
 
@@ -80,14 +86,7 @@ type Table = {
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const extractTablePaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.extractTable,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.extractTable),
   error: "Payment required",
 };
 
@@ -99,8 +98,6 @@ extractTableRouter.head("/extract/table", (_req: Request, res: Response) => {
   res.status(402).end();
 });
 
-const anthropic = new Anthropic();
-
 function gradeFromScore(score: number): string {
   if (score >= 90) return "A";
   if (score >= 75) return "B";
@@ -109,13 +106,13 @@ function gradeFromScore(score: number): string {
   return "F";
 }
 
-// The model is prefilled with "{" (see attemptExtract) to force a JSON object, so
-// a real reply continues the object WITHOUT the leading brace. Try with the brace
-// restored first; fall back to the raw loose parse for replies that already carry
-// their own braces (e.g. test fixtures, or a model that echoed the whole object).
-// This is what lets a no-table / instruction-only input ("please extract the
-// tables from this PDF") come back as a clean empty table instead of prose the
-// parser chokes on → a misleading 502.
+// json_object mode returns a complete JSON object (with braces), so the raw loose
+// parse handles the normal case. We still try a leading-brace restore FIRST to
+// stay tolerant of a brace-less reply (a legacy of the earlier assistant "{"
+// prefill), falling back to the raw loose parse otherwise. This is what lets a
+// no-table / instruction-only input ("please extract the tables from this PDF")
+// come back as a clean empty table instead of prose the parser chokes on → a
+// misleading 502.
 function parsePrefilledJson(text: string): unknown {
   try {
     return parseLooseJson("{" + text);
@@ -179,36 +176,26 @@ type AttemptResult =
   | { ok: true; data: ParsedTable; usage: { inputTokens: number; outputTokens: number } }
   | { ok: false; truncated: true };
 
-async function attemptExtract(text: string, signal: AbortSignal): Promise<AttemptResult> {
-  const response = await anthropic.messages.create(
-    {
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      // Prefill the assistant turn with "{" so the model cannot answer in prose —
-      // it must continue a JSON object. This is the core fix for instruction-like
-      // inputs (which previously made Haiku reply conversationally → 502).
-      messages: [
-        { role: "user", content: text },
-        { role: "assistant", content: "{" },
-      ],
-    },
-    { signal },
-  );
+async function attemptExtract(text: string): Promise<AttemptResult> {
+  // json_object mode forces the model to emit a JSON object (never prose), which
+  // is the core fix for instruction-like inputs. openaiJsonComplete self-manages
+  // a hard wall-clock timeout (aborts the upstream request) — no signal needed.
+  const { content, usage, truncated } = await openaiJsonComplete({
+    modelId: MODEL,
+    system: SYSTEM_PROMPT,
+    user: text,
+    maxTokens: MAX_TOKENS,
+    timeoutMs: timeouts.extractTable,
+  });
 
-  // Truncation guard: if the model hit max_tokens the output may be partial/invalid.
+  // Truncation guard: if the model hit the output cap the JSON may be partial/invalid.
   // Treat as a failed extraction (502), never parse/return partial JSON as a 200.
   // Applied on BOTH the initial call and the retry.
-  if (response.stop_reason === "max_tokens") {
+  if (truncated) {
     return { ok: false, truncated: true };
   }
 
-  const textBlock = response.content.find(
-    (block): block is Anthropic.ContentBlock & { type: "text" } => block.type === "text",
-  );
-  if (!textBlock) throw new Error("no text content");
-
-  const parsed = parsePrefilledJson(textBlock.text);
+  const parsed = parsePrefilledJson(content);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("not an object");
   }
@@ -222,8 +209,8 @@ async function attemptExtract(text: string, signal: AbortSignal): Promise<Attemp
       model_row_count: asNumberOrNull(p.row_count),
     },
     usage: {
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
     },
   };
 }
@@ -262,28 +249,20 @@ extractTableRouter.post("/extract/table", async (req: Request, res: Response) =>
       return;
     }
 
-    // Bound the call(s) with an AbortController so a timeout actually CANCELS the
-    // upstream request, not just the caller's promise.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeouts.extractTable);
-
     let data: ParsedTable;
     try {
       let attempt: AttemptResult;
       try {
-        attempt = await attemptExtract(text, controller.signal);
+        attempt = await attemptExtract(text);
       } catch (parseErr) {
         // Retry-once on malformed JSON. This is a DELIBERATE ENHANCEMENT over
         // schema-parse (which single-shots) — do NOT remove it to "match" that
-        // route. API/abort errors are not retried here; they rethrow below.
-        if (
-          parseErr instanceof Anthropic.APIError ||
-          (parseErr instanceof Error &&
-            (parseErr.name === "AbortError" || parseErr.name === "APIUserAbortError"))
-        ) {
+        // route. Upstream/transport errors (OpenAiCallError) are not retried
+        // here; they rethrow below.
+        if (parseErr instanceof OpenAiCallError) {
           throw parseErr;
         }
-        attempt = await attemptExtract(text, controller.signal);
+        attempt = await attemptExtract(text);
       }
 
       // Truncation on either attempt is a hard failure — not a billable 200.
@@ -297,17 +276,12 @@ extractTableRouter.post("/extract/table", async (req: Request, res: Response) =>
       data = attempt.data;
       // Record token usage for per-call cost/margin logging (read at res.finish).
       res.locals.llmUsage = {
-        model: "claude-haiku-4-5-20251001",
+        model: MODEL,
         inputTokens: attempt.usage.inputTokens,
         outputTokens: attempt.usage.outputTokens,
       };
     } catch (err) {
-      clearTimeout(timer);
-      if (
-        err instanceof Anthropic.APIError ||
-        (err instanceof Error &&
-          (err.name === "AbortError" || err.name === "APIUserAbortError"))
-      ) {
+      if (err instanceof OpenAiCallError) {
         console.error("Extract table LLM error:", err);
         res.status(502).json({ error: "Table extraction service unavailable" });
         return;
@@ -320,7 +294,6 @@ extractTableRouter.post("/extract/table", async (req: Request, res: Response) =>
       });
       return;
     }
-    clearTimeout(timer);
 
     // row_count is authoritative from rows.length — we trust the actual parsed
     // rows over whatever count the model self-reported.

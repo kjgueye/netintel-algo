@@ -1,12 +1,15 @@
 import { Router, type Request, type Response } from "express";
-import Anthropic from "@anthropic-ai/sdk";
-import { config, pricing, timeouts } from "../config.js";
+import { pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { resolveTextField, resolveTargetField, resolveSourceField } from "../utils/translate-fields.js";
 import { resolveLanguage, resolveTarget, targetInstruction, targetHint, isAutoSource } from "../utils/translate-language.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
+import { openaiJsonComplete, OpenAiCallError } from "../services/openai-json.js";
 
 export const translateLongRouter = Router();
+
+const MODEL = "gpt-4o-mini";
 
 // LONG tier cap: reject text over 2000 words. Short snippets should use /translate/short.
 const MAX_WORDS = 2000;
@@ -33,14 +36,7 @@ function gradeFromScore(score: number): string {
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const translateLongPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.translateLong,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.translateLong),
   error: "Payment required",
 };
 
@@ -51,8 +47,6 @@ translateLongRouter.get("/translate/long", (_req: Request, res: Response) => {
 translateLongRouter.head("/translate/long", (_req: Request, res: Response) => {
   res.status(402).end();
 });
-
-const anthropic = new Anthropic();
 
 translateLongRouter.post("/translate/long", async (req: Request, res: Response) => {
   try {
@@ -112,34 +106,24 @@ translateLongRouter.post("/translate/long", async (req: Request, res: Response) 
 
     let parsed: any;
     try {
-      const response = await Promise.race([
-        anthropic.messages.create({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 8192,
-          system: systemPrompt,
-          messages: [{ role: "user", content: text }],
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), timeouts.translateLong),
-        ),
-      ]);
+      const { content, usage } = await openaiJsonComplete({
+        modelId: MODEL,
+        system: systemPrompt,
+        user: text,
+        maxTokens: 8192,
+        timeoutMs: timeouts.translateLong,
+      });
 
-      const textBlock = response.content.find(
-        (block): block is Anthropic.ContentBlock & { type: "text" } =>
-          block.type === "text",
-      );
-      if (!textBlock) throw new Error("no text content");
-
-      parsed = parseLooseJson(textBlock.text);
+      parsed = parseLooseJson(content);
 
       // Record token usage for per-call cost/margin logging (read at res.finish).
       res.locals.llmUsage = {
-        model: "claude-haiku-4-5-20251001",
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
+        model: MODEL,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
       };
     } catch (err) {
-      if (err instanceof Anthropic.APIError || (err instanceof Error && err.message === "timeout")) {
+      if (err instanceof OpenAiCallError) {
         console.error("Translate (long) LLM error:", err);
       } else {
         console.error("Translate (long) parse error:", err);

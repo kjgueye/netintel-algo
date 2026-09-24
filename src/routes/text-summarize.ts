@@ -2,7 +2,9 @@ import { Router, type Request, type Response } from "express";
 import Anthropic from "@anthropic-ai/sdk";
 import { config, pricing, timeouts } from "../config.js";
 import { validateUrl, checkSsrf, ValidationError } from "../utils/validators.js";
+import { safeFetch, FetchProblem } from "../utils/safe-fetch.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
 
 export const textSummarizeRouter = Router();
 
@@ -13,14 +15,7 @@ const MAX_BYTES = 50 * 1024;
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const textSummarizePaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.textSummarize,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.textSummarize),
   error: "Payment required",
 };
 
@@ -110,43 +105,19 @@ async function fetchAndExtract(rawUrl: string): Promise<string> {
   const parsed = validateUrl(rawUrl);
   await checkSsrf(parsed.hostname);
 
-  const controller = new AbortController();
   // URL fetch uses a fixed 10s timeout (distinct from the LLM timeout).
-  const timeout = setTimeout(() => controller.abort(), 10000);
+  // safeFetch SSRF-checks every redirect hop before requesting it and caps
+  // the body read at 500 KB under that same deadline.
+  const r = await safeFetch(parsed, {
+    headers: {
+      "User-Agent": "NetIntel/1.0",
+      "Accept": "text/html",
+    },
+    timeoutMs: 10000,
+    maxBytes: 500 * 1024,
+  });
 
-  let html = "";
-  try {
-    const response = await fetch(parsed.href, {
-      method: "GET",
-      headers: {
-        "User-Agent": "NetIntel/1.0",
-        "Accept": "text/html",
-      },
-      redirect: "follow",
-      signal: controller.signal,
-    });
-
-    // Read max 500KB
-    const reader = response.body?.getReader();
-    if (reader) {
-      const chunks: Uint8Array[] = [];
-      let totalSize = 0;
-      const maxSize = 500 * 1024;
-      while (totalSize < maxSize) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        totalSize += value.length;
-      }
-      reader.cancel().catch(() => {});
-      const decoder = new TextDecoder();
-      html = chunks.map((c) => decoder.decode(c, { stream: true })).join("");
-    }
-  } finally {
-    clearTimeout(timeout);
-  }
-
-  return extractContent(html);
+  return extractContent(r.text);
 }
 
 textSummarizeRouter.post("/text-summarize", async (req: Request, res: Response) => {
@@ -279,6 +250,12 @@ textSummarizeRouter.post("/text-summarize", async (req: Request, res: Response) 
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof FetchProblem) {
+      // Refused redirect on the url fetch (non-http scheme / too many hops) —
+      // its own uncharged status, not a 500.
+      res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
     console.error("Text summarize error:", err);

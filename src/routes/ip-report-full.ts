@@ -195,6 +195,9 @@ ipReportFullRouter.get("/ip-report/full", async (req: Request, res: Response) =>
     const risk = riskOk
       ? {
           available: true,
+          // 100 = clean/trusted (higher-is-better); risk_score is the
+          // deprecated same-value alias — see IpRiskResult in ip-risk.ts.
+          trust_score: riskData!.trust_score,
           risk_score: riskData!.risk_score,
           recommendation: riskData!.recommendation,
         }

@@ -77,8 +77,12 @@ waybackRouter.get("/wayback/lookup", async (req: Request, res: Response) => {
 
     // --- Concurrent calls: availability API, first capture, last capture ---
     const availabilityUrl = `https://archive.org/wayback/available?url=${encodeURIComponent(targetUrl)}${timestamp ? `&timestamp=${timestamp}` : ""}`;
-    const firstCaptureUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(targetUrl)}&output=json&limit=1&fl=timestamp&order=asc`;
-    const lastCaptureUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(targetUrl)}&output=json&limit=1&fl=timestamp&order=desc`;
+    // CDX has no `order` parameter (it silently ignores one): results are
+    // always oldest-first, `limit=1` takes the first row and `limit=-1` the
+    // last. The old `order=desc` query returned the FIRST capture, so
+    // last_capture was either wrong or null (2026-07-30 sweep audit).
+    const firstCaptureUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(targetUrl)}&output=json&limit=1&fl=timestamp`;
+    const lastCaptureUrl = `https://web.archive.org/cdx/search/cdx?url=${encodeURIComponent(targetUrl)}&output=json&limit=-1&fl=timestamp`;
 
     const [availResult, firstResult, lastResult] = await Promise.allSettled([
       fetchJsonRetry(availabilityUrl, timeout),
@@ -126,6 +130,26 @@ waybackRouter.get("/wayback/lookup", async (req: Request, res: Response) => {
         lastCapture = formatWaybackTimestamp(data[1][0]);
         isArchived = true;
       }
+    }
+
+    // "Never archived" needs POSITIVE evidence of absence: at least one CDX
+    // query must have SUCCEEDED (a parsed JSON array — [] genuinely means no
+    // captures). fetchJsonRetry rejects on non-200, HTML block pages and
+    // empty bodies, so a fulfilled array is conclusive; a rejection is not.
+    // Without this, an archive.org rate-limit burst (it throttles shared
+    // datacenter egress hard) made the 2026-07-30 verify run answer "never
+    // archived" for example.com — 6,400+ real captures — and bill for it.
+    // Unknown must degrade to an uncharged 503, not a confident wrong answer.
+    const cdxConclusive =
+      (firstResult.status === "fulfilled" && Array.isArray(firstResult.value)) ||
+      (lastResult.status === "fulfilled" && Array.isArray(lastResult.value));
+    if (!isArchived && !cdxConclusive) {
+      res.status(503).json({
+        code: "UPSTREAM_UNAVAILABLE",
+        error:
+          "The Wayback Machine did not answer (rate limit or outage), so the archive status is unknown — this is NOT 'never archived'. Transient; retry in a minute. You were not charged.",
+      });
+      return;
     }
 
     // --- Capture count estimate (showNumPages) ---

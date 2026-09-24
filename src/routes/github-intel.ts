@@ -100,7 +100,13 @@ async function handleGithubIntel(req: Request, res: Response): Promise<void> {
         safeFetch(baseUrl),
         safeFetch(`${baseUrl}/languages`),
         safeFetch(`${baseUrl}/releases/latest`),
-        safeFetch(`${baseUrl}/contributors?per_page=100&anon=false`),
+        // per_page=1: the Link header's rel="last" page number IS the exact
+        // contributor count, in one request. The old per_page=100 array-length
+        // read silently capped the count at 100 (expressjs/express reported
+        // exactly "100"; 2026-07-30 sweep audit). GitHub truncates this
+        // endpoint at 500 contributors, so huge repos report 500 — a floor,
+        // but a far better one.
+        safeFetch(`${baseUrl}/contributors?per_page=1&anon=false`),
       ]);
 
     // Process main repo response
@@ -149,12 +155,20 @@ async function handleGithubIntel(req: Request, res: Response): Promise<void> {
       latestReleaseDate = releaseData.published_at ?? null;
     }
 
-    // Process contributors
+    // Process contributors: exact count from the Link rel="last" page number;
+    // no Link header means the whole result fit on one page, so the array
+    // length is already exact.
     const contribRes = contributorsResult.status === "fulfilled" ? contributorsResult.value : null;
     let contributorCount = 0;
     if (contribRes && contribRes.ok) {
-      const contribData = await contribRes.json();
-      contributorCount = Array.isArray(contribData) ? contribData.length : 0;
+      const link = contribRes.headers?.get?.("link");
+      const last = typeof link === "string" ? link.match(/[?&]page=(\d+)[^>]*>;\s*rel="last"/) : null;
+      if (last) {
+        contributorCount = parseInt(last[1], 10);
+      } else {
+        const contribData = await contribRes.json();
+        contributorCount = Array.isArray(contribData) ? contribData.length : 0;
+      }
     }
 
     // Calculate days since last push

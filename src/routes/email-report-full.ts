@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import { pickRequestParam } from "../utils/field-aliases.js";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
 import { runEmailAuth, type EmailAuthResult } from "./email-auth.js";
@@ -58,9 +59,9 @@ function calculateGrade(score: number): string {
 
 // --- Route handler ---
 
-emailReportFullRouter.get("/email-report/full", async (req: Request, res: Response) => {
+const handleEmailReportFull = async (req: Request, res: Response) => {
   try {
-    const email = req.query.email as string | undefined;
+    const email = pickRequestParam(req, ["email", "address", "mail"]);
     if (!email) {
       res.status(400).json({ error: "email is required" });
       return;
@@ -76,7 +77,9 @@ emailReportFullRouter.get("/email-report/full", async (req: Request, res: Respon
     const domain = validateDomain(rawDomain);
 
     // The breach section only runs when the caller supplies a password to vet.
-    const rawPassword = req.query.password;
+    // Optional password, same transport concern as /breach-check/password:
+    // accept it in the BODY so it never has to appear in a URL.
+    const rawPassword = pickRequestParam(req, ["password", "pass", "pwd"]);
     const password =
       typeof rawPassword === "string" && rawPassword.length > 0 ? rawPassword : null;
 
@@ -228,4 +231,7 @@ emailReportFullRouter.get("/email-report/full", async (req: Request, res: Respon
     console.error("email-report-full error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
-});
+};
+
+emailReportFullRouter.get("/email-report/full", handleEmailReportFull);
+emailReportFullRouter.post("/email-report/full", handleEmailReportFull);

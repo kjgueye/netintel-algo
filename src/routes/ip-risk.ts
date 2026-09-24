@@ -170,6 +170,14 @@ async function runBlacklist(ip: string, isIpv4: boolean): Promise<BlacklistResul
 
 export interface IpRiskResult {
   ip: string;
+  /**
+   * 100 = clean/trusted, 0 = maximum risk — the same higher-is-better polarity
+   * as grade/score everywhere else on this API. Named trust_score because
+   * "risk_score" reads as higher-is-riskier (and /ip-reputation uses it that
+   * way); the 2026-07-30 sweep audit flagged the clash.
+   */
+  trust_score: number;
+  /** Deprecated alias of trust_score (same value), kept for existing consumers. */
   risk_score: number;
   grade: string;
   recommendation: string;
@@ -310,7 +318,8 @@ export async function runIpRisk(ip: string): Promise<IpRiskResult> {
 
     return {
       ip,
-      risk_score: score,
+      trust_score: score,
+      risk_score: score, // deprecated alias — see IpRiskResult
       grade: calculateGrade(score),
       recommendation: getRecommendation(score),
       geo,

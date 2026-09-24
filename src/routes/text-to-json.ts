@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { config, pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
+import { signableAccepts } from "../accepts.js";
 
 export const textToJsonRouter = Router();
 
@@ -89,14 +90,7 @@ function cacheSet(key: string, value: CachedExtraction): void {
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const textToJsonPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.textToJson,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.textToJson),
   error: "Payment required",
 };
 

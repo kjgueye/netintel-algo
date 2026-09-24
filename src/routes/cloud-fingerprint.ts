@@ -1,7 +1,9 @@
 import { Router, type Request, type Response } from "express";
 import dns from "node:dns/promises";
+import tls from "node:tls";
 import { queryDns, RECORD_TYPES, type DnsAnswer } from "../utils/dns-resolvers.js";
 import { validateDomain, checkSsrf, ValidationError } from "../utils/validators.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 
 export const cloudFingerprintRouter = Router();
 
@@ -41,6 +43,90 @@ const NOTABLE_HEADER_NAMES = new Set([
   "x-served-by", "x-vercel-id", "x-nf-request-id", "x-azure-ref",
   "x-check-cacheable", "x-cdn", "x-iinfo", "x-sucuri-id", "x-amzn-requestid",
 ]);
+
+// --- TLS probe ---
+
+// Three cert facts only: who issued it, whether it covers a wildcard, and how
+// many names it carries. Keeps its own tls.connect rather than importing one
+// from ssl.ts / ssl-cert-quick.ts — those routes deliberately each own their
+// handshake (see the note at the top of ssl-cert-quick.ts), and this probe
+// needs a fraction of what they parse.
+//
+// NEVER rejects: the cert is a bonus signal for fingerprinting, so any
+// failure (timeout, refused, handshake error, no cert) resolves to all-nulls
+// and the rest of the fingerprint proceeds. Runs alongside the HTTP probes,
+// so it costs no extra wall-clock. SSRF is already checked by the caller.
+const TLS_PROBE_TIMEOUT_MS = 4000;
+
+interface TlsSummary {
+  issuer: string | null;
+  wildcard: boolean | null;
+  san_count: number | null;
+}
+
+const TLS_UNKNOWN: TlsSummary = { issuer: null, wildcard: null, san_count: null };
+
+function certField(obj: tls.Certificate | undefined, key: string): string | null {
+  if (!obj) return null;
+  const val = (obj as unknown as Record<string, unknown>)[key];
+  return typeof val === "string" ? val : null;
+}
+
+function probeTls(domain: string): Promise<TlsSummary> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (summary: TlsSummary, socket?: tls.TLSSocket) => {
+      socket?.destroy();
+      if (settled) return;
+      settled = true;
+      resolve(summary);
+    };
+
+    let socket: tls.TLSSocket;
+    try {
+      socket = tls.connect(
+        {
+          host: domain,
+          port: 443,
+          servername: domain,
+          timeout: TLS_PROBE_TIMEOUT_MS,
+          // We are reading the cert, not trusting it — an expired or
+          // self-signed cert is a fingerprinting signal, not a reason to bail.
+          rejectUnauthorized: false,
+        },
+        () => {
+          const cert = socket.getPeerCertificate(false);
+          if (!cert || !cert.subject) return finish(TLS_UNKNOWN, socket);
+
+          const sans = (cert.subjectaltname ?? "")
+            .split(",")
+            .map((e) => e.trim())
+            .filter((e) => e.startsWith("DNS:"))
+            .map((e) => e.slice(4));
+
+          const subjectCn = certField(cert.subject, "CN");
+          // Organization first — "Let's Encrypt" identifies the issuer far
+          // better than a CN like "R11" or "E5".
+          const issuer = certField(cert.issuer, "O") ?? certField(cert.issuer, "CN");
+
+          finish(
+            {
+              issuer,
+              wildcard: sans.some((s) => s.startsWith("*.")) || (subjectCn?.startsWith("*.") ?? false),
+              san_count: sans.length,
+            },
+            socket,
+          );
+        },
+      );
+    } catch {
+      return finish(TLS_UNKNOWN);
+    }
+
+    socket.on("error", () => finish(TLS_UNKNOWN, socket));
+    socket.on("timeout", () => finish(TLS_UNKNOWN, socket));
+  });
+}
 
 // --- Detection helpers ---
 
@@ -306,6 +392,10 @@ export interface CloudFingerprintResult {
   domain: string;
   resolved_ips: string[];
   cname_chain: string[];
+  // false = neither the https nor the http probe got a response, so every
+  // header-derived field below is "unknown", NOT "absent". Check this before
+  // reading cdn/waf/http_fingerprint — see the scoring note further down.
+  http_reachable: boolean;
   hosting: ProviderResult;
   cdn: ProviderResult;
   waf: WafResult[];
@@ -313,7 +403,9 @@ export interface CloudFingerprintResult {
   email_provider: ProviderResult;
   http_fingerprint: HttpFingerprint;
   tls: { issuer: string | null; wildcard: boolean | null; san_count: number | null };
-  score: number;
+  // null when http_reachable is false — we have no basis to grade a host we
+  // could not reach. Callers must null-check: `score < 50` is true for null.
+  score: number | null;
   grade: string;
   findings: Finding[];
 }
@@ -361,18 +453,22 @@ export async function runCloudFingerprint(domain: string): Promise<CloudFingerpr
     let serverHeader: string | null = null;
     let xPoweredBy: string | null = null;
 
-    const [httpsResult, httpResult] = await Promise.allSettled([
-      fetch(`https://${domain}`, {
-        method: "HEAD",
-        redirect: "follow",
-        signal: AbortSignal.timeout(5000),
-      }),
+    const [httpsResult, httpResult, tlsResult] = await Promise.allSettled([
+      // Follows redirects with every hop SSRF-checked before it is requested;
+      // a blocked hop rejects and allSettled treats it like any probe failure.
+      safeFetch(`https://${domain}`, { method: "HEAD", timeoutMs: 5000 }),
+      // The http probe deliberately does NOT follow — it only inspects the
+      // first hop's Location to judge https enforcement.
       fetch(`http://${domain}`, {
         method: "HEAD",
         redirect: "manual",
         signal: AbortSignal.timeout(5000),
       }),
+      // Never rejects; resolves to all-nulls when there is no cert to read.
+      probeTls(domain),
     ]);
+
+    const tlsSummary: TlsSummary = tlsResult.status === "fulfilled" ? tlsResult.value : TLS_UNKNOWN;
 
     if (httpsResult.status === "fulfilled") {
       httpsHeaders = httpsResult.value.headers;
@@ -419,15 +515,47 @@ export async function runCloudFingerprint(domain: string): Promise<CloudFingerpr
     };
 
     // --- Grading ---
+    // A host can resolve in DNS and still answer nothing on 80/443 — internal
+    // apps, VPN/gateway endpoints, and firewalled records are all published in
+    // public DNS. When both probes fail we know NOTHING about its CDN, WAF or
+    // headers, so scoring the absences would report "not detected" as "absent"
+    // and hand back a confident D for a host we never touched. Grade only what
+    // we actually observed; DNS-derived rules still apply.
+    const httpReachable = httpsResult.status === "fulfilled" || httpResult.status === "fulfilled";
+
     let score = 100;
     const findings: Finding[] = [];
 
-    if (cdn.provider === null) {
+    if (!httpReachable) {
+      findings.push({
+        rule: "probe_unreachable",
+        label: "Host did not respond on HTTP or HTTPS",
+        impact: 0,
+        detail:
+          "The domain resolves, but neither https:// nor http:// returned a response within 5s — the host is firewalled, not serving the public internet, or not a web host. CDN, WAF and header fields are unknown (not absent) and no grade is issued.",
+      });
+
+      // A live TLS listener behind a silent HTTP layer is a real finding, not
+      // a contradiction: mTLS-gated gateways, VPN/appliance endpoints and
+      // IP-allowlisted apps all complete a handshake and then say nothing.
+      // For a caller triaging hostnames this separates "dead record" from
+      // "live service you cannot reach", so it is worth its own rule.
+      if (tlsSummary.issuer !== null) {
+        findings.push({
+          rule: "tls_only",
+          label: "TLS listener present but HTTP silent",
+          impact: 0,
+          detail: `Port 443 completed a TLS handshake (certificate issued by ${tlsSummary.issuer}) but no HTTP response followed — a live service that does not serve the public web.`,
+        });
+      }
+    }
+
+    if (httpReachable && cdn.provider === null) {
       findings.push({ rule: "no_cdn", label: "No CDN detected", impact: -25, detail: "No CDN/edge provider detected — origin server may be directly exposed" });
       score -= 25;
     }
 
-    if (waf.length === 0) {
+    if (httpReachable && waf.length === 0) {
       findings.push({ rule: "no_waf", label: "No WAF detected", impact: -20, detail: "No Web Application Firewall detected" });
       score -= 20;
     }
@@ -458,20 +586,22 @@ export async function runCloudFingerprint(domain: string): Promise<CloudFingerpr
     }
 
     score = Math.max(0, score);
-    const grade = calculateGrade(score);
+    const finalScore = httpReachable ? score : null;
+    const grade = httpReachable ? calculateGrade(score) : "insufficient_data";
 
     return {
       domain,
       resolved_ips: resolvedIps,
       cname_chain: cnameChain,
+      http_reachable: httpReachable,
       hosting,
       cdn,
       waf,
       dns_provider: dnsProvider,
       email_provider: emailProvider,
       http_fingerprint: httpFingerprint,
-      tls: { issuer: null, wildcard: null, san_count: null },
-      score,
+      tls: tlsSummary,
+      score: finalScore,
       grade,
       findings,
     };

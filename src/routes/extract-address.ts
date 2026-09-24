@@ -1,11 +1,16 @@
 import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
-import Anthropic from "@anthropic-ai/sdk";
-import { config, pricing, timeouts } from "../config.js";
+import { pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
+import { openaiJsonComplete, OpenAiCallError } from "../services/openai-json.js";
 
 export const extractAddressRouter = Router();
+
+// gpt-4o-mini (JSON-mode) — swapped from Anthropic Haiku 2026-09-02; see
+// src/services/openai-json.ts for the pricing rationale.
+const MODEL = "gpt-4o-mini";
 
 // Input cap shared across the Batch-3 LLM extraction endpoints: reject input
 // over 10k words OR 50KB, whichever trips first. Addresses are tiny so this
@@ -71,14 +76,7 @@ type AddressFields = {
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const extractAddressPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.extractAddress,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.extractAddress),
   error: "Payment required",
 };
 
@@ -89,8 +87,6 @@ extractAddressRouter.get("/extract/address", (_req: Request, res: Response) => {
 extractAddressRouter.head("/extract/address", (_req: Request, res: Response) => {
   res.status(402).end();
 });
-
-const anthropic = new Anthropic();
 
 function gradeFromScore(score: number): string {
   if (score >= 90) return "A";
@@ -119,30 +115,25 @@ type AttemptResult =
   | { ok: true; fields: AddressFields; usage: { inputTokens: number; outputTokens: number } }
   | { ok: false; truncated: true };
 
-async function attemptExtract(address: string, signal: AbortSignal): Promise<AttemptResult> {
-  const response = await anthropic.messages.create(
-    {
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: address }],
-    },
-    { signal },
-  );
+async function attemptExtract(address: string): Promise<AttemptResult> {
+  // openaiJsonComplete self-manages its own wall-clock timeout/abort, so no
+  // AbortSignal is threaded in here anymore.
+  const { content, usage, truncated } = await openaiJsonComplete({
+    modelId: MODEL,
+    system: SYSTEM_PROMPT,
+    user: address,
+    maxTokens: MAX_TOKENS,
+    timeoutMs: timeouts.extractAddress,
+  });
 
-  // Truncation guard: if the model hit max_tokens the output may be partial/invalid.
+  // Truncation guard: if the model hit the token cap the output may be partial/invalid.
   // Treat as a failed extraction (502), never parse/return partial JSON as a 200.
   // Applied on BOTH the initial call and the retry.
-  if (response.stop_reason === "max_tokens") {
+  if (truncated) {
     return { ok: false, truncated: true };
   }
 
-  const textBlock = response.content.find(
-    (block): block is Anthropic.ContentBlock & { type: "text" } => block.type === "text",
-  );
-  if (!textBlock) throw new Error("no text content");
-
-  const parsed = parseLooseJson(textBlock.text);
+  const parsed = parseLooseJson(content);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("not an object");
   }
@@ -160,8 +151,8 @@ async function attemptExtract(address: string, signal: AbortSignal): Promise<Att
       normalized: asStringOrNull(p.normalized),
     },
     usage: {
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
     },
   };
 }
@@ -193,28 +184,19 @@ extractAddressRouter.post("/extract/address", async (req: Request, res: Response
       return;
     }
 
-    // Bound the call(s) with an AbortController so a timeout actually CANCELS the
-    // upstream request, not just the caller's promise.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeouts.extractAddress);
-
     let fields: AddressFields;
     try {
       let attempt: AttemptResult;
       try {
-        attempt = await attemptExtract(address, controller.signal);
+        attempt = await attemptExtract(address);
       } catch (parseErr) {
         // Retry-once on malformed JSON. This is a DELIBERATE ENHANCEMENT over
         // schema-parse (which single-shots) — do NOT remove it to "match" that
-        // route. API/abort errors are not retried here; they rethrow below.
-        if (
-          parseErr instanceof Anthropic.APIError ||
-          (parseErr instanceof Error &&
-            (parseErr.name === "AbortError" || parseErr.name === "APIUserAbortError"))
-        ) {
+        // route. Upstream/timeout errors are not retried here; they rethrow below.
+        if (parseErr instanceof OpenAiCallError) {
           throw parseErr;
         }
-        attempt = await attemptExtract(address, controller.signal);
+        attempt = await attemptExtract(address);
       }
 
       // Truncation on either attempt is a hard failure — not a billable 200.
@@ -228,17 +210,12 @@ extractAddressRouter.post("/extract/address", async (req: Request, res: Response
       fields = attempt.fields;
       // Record token usage for per-call cost/margin logging (read at res.finish).
       res.locals.llmUsage = {
-        model: "claude-haiku-4-5-20251001",
+        model: MODEL,
         inputTokens: attempt.usage.inputTokens,
         outputTokens: attempt.usage.outputTokens,
       };
     } catch (err) {
-      clearTimeout(timer);
-      if (
-        err instanceof Anthropic.APIError ||
-        (err instanceof Error &&
-          (err.name === "AbortError" || err.name === "APIUserAbortError"))
-      ) {
+      if (err instanceof OpenAiCallError) {
         console.error("Extract address LLM error:", err);
         res.status(502).json({ error: "Address extraction service unavailable" });
         return;
@@ -251,7 +228,6 @@ extractAddressRouter.post("/extract/address", async (req: Request, res: Response
       });
       return;
     }
-    clearTimeout(timer);
 
     // components_found counts the five core components (excludes country_code/normalized).
     const components_found = [

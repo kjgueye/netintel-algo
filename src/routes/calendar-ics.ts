@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { createHash } from "node:crypto";
 import { config, pricing } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
+import { signableAccepts } from "../accepts.js";
 
 export const calendarIcsRouter = Router();
 
@@ -9,14 +10,7 @@ export const calendarIcsRouter = Router();
 // instead of a 404.
 const calendarIcsPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.calendarIcs,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.calendarIcs),
   error: "Payment required",
 };
 

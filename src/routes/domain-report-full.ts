@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
 import { runDnsLookup } from "./dns.js";
+import { deliverableMxHosts } from "../utils/dns-resolvers.js";
 import { runSslAnalyze } from "./ssl.js";
 import { runWhoisRdap } from "./whois-rdap.js";
 import { runCloudFingerprint } from "./cloud-fingerprint.js";
@@ -97,11 +98,14 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
 
     // --- Sections (standard partial-failure shape) ---
     const dnsData = dnsOk ? dnsR.value : null;
+    // Real deliverable MX hosts only — a null MX (RFC 7505) is filtered out, so
+    // we never emit mx_records:[""] or count it as mail infra.
+    const deliverableMx = dnsData ? deliverableMxHosts(dnsData.records.MX) : [];
     const dns = dnsOk
       ? {
           available: true,
           a_records: dnsData!.records.A,
-          mx_records: dnsData!.records.MX.map((m) => m.exchange),
+          mx_records: deliverableMx,
           ns_records: dnsData!.records.NS,
           txt_records: dnsData!.records.TXT,
         }
@@ -204,8 +208,8 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
       deduct("ssl_unavailable", 15, "SSL section failed or no certificate present");
     }
 
-    if (dnsOk && dnsData!.records.MX.length === 0) {
-      deduct("no_mx_records", 10, "DNS resolved but no MX records found");
+    if (dnsOk && deliverableMx.length === 0) {
+      deduct("no_mx_records", 10, "DNS resolved but no deliverable MX records found");
     }
 
     if (secOk && !secData!.hsts_present && !secData!.csp_present) {

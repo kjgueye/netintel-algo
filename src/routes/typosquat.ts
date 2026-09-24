@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { queryDns, RECORD_TYPES, type DnsAnswer } from "../utils/dns-resolvers.js";
+import { nsPresence } from "../utils/dns-resolvers.js";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
 
@@ -149,23 +149,13 @@ function buildVariations(name: string, tld: string, limit: number): Array<{ doma
 
 // --- Registration check (DNS NS) ---
 
-// NS records exist → registered; NXDOMAIN/none/error/timeout → treated as available.
+// NS answers or NOERROR-without-NS → registered; SERVFAIL also counts as
+// registered (a lame-delegated parked lookalike is still a registration — the
+// old []-means-available read hid those from the threat count). NXDOMAIN or
+// no verdict (timeout/refusal) → not registered.
 async function isRegistered(domain: string): Promise<boolean> {
-  const TIMED_OUT = Symbol("timeout");
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
-    timer = setTimeout(() => resolve(TIMED_OUT), timeouts.typosquat);
-  });
-
-  try {
-    const result = await Promise.race([queryDns(domain, RECORD_TYPES.NS), timeout]);
-    if (result === TIMED_OUT) return false;
-    return (result as DnsAnswer[]).length > 0;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
+  const presence = await nsPresence(domain, timeouts.typosquat);
+  return presence === "registered" || presence === "servfail";
 }
 
 // --- Grading ---
@@ -178,17 +168,14 @@ function calculateGrade(score: number): string {
   return "F";
 }
 
-// --- Route handler ---
+// --- Extracted scan logic (shared with the domain-vet aggregator) ---
 
-typosquatRouter.get("/typosquat/scan", async (req: Request, res: Response) => {
-  try {
-    const rawDomain = req.query.domain as string | undefined;
-
-    if (rawDomain === undefined || rawDomain.trim() === "") {
-      res.status(400).json({ error: "domain is required" });
-      return;
-    }
-
+/**
+ * Generate look-alike variations of a domain and check which are registered.
+ * Validates its inputs (throws ValidationError on a bad domain or limit) and
+ * returns the same object shape the /typosquat/scan route responds with.
+ */
+export async function runTyposquat(rawDomain: string, rawLimit?: unknown) {
     const input = rawDomain.trim().toLowerCase();
     if (!input.includes(".")) {
       throw new ValidationError("domain must include a TLD");
@@ -197,8 +184,8 @@ typosquatRouter.get("/typosquat/scan", async (req: Request, res: Response) => {
 
     // limit (default 30, max 50)
     let limit = DEFAULT_LIMIT;
-    if (req.query.limit !== undefined) {
-      const parsed = parseInt(req.query.limit as string, 10);
+    if (rawLimit !== undefined) {
+      const parsed = parseInt(rawLimit as string, 10);
       if (Number.isNaN(parsed) || parsed < 1 || parsed > MAX_LIMIT) {
         throw new ValidationError("limit must be between 1 and 50");
       }
@@ -269,7 +256,7 @@ typosquatRouter.get("/typosquat/scan", async (req: Request, res: Response) => {
     score = Math.max(0, score);
     const grade = calculateGrade(score);
 
-    res.json({
+    return {
       domain,
       name,
       tld,
@@ -281,7 +268,21 @@ typosquatRouter.get("/typosquat/scan", async (req: Request, res: Response) => {
       score,
       grade,
       findings,
-    });
+    };
+}
+
+// --- Route handler ---
+
+typosquatRouter.get("/typosquat/scan", async (req: Request, res: Response) => {
+  try {
+    const rawDomain = req.query.domain as string | undefined;
+
+    if (rawDomain === undefined || rawDomain.trim() === "") {
+      res.status(400).json({ error: "domain is required" });
+      return;
+    }
+
+    res.json(await runTyposquat(rawDomain, req.query.limit));
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ error: err.message });

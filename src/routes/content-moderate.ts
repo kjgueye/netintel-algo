@@ -1,10 +1,16 @@
 import { Router, type Request, type Response } from "express";
-import Anthropic from "@anthropic-ai/sdk";
-import { config, pricing, timeouts } from "../config.js";
+import { pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
+import { openaiJsonComplete, OpenAiCallError } from "../services/openai-json.js";
 
 export const contentModerateRouter = Router();
+
+// gpt-4o-mini: worst-case COGS at the 10k-word cap (~14k in + 1024 out) ≈ $0.0027,
+// safely under the $0.005 flat price. Swapped from Haiku 2026-09-02 (which forced
+// $0.05) — see the pricing deep-dive / src/services/openai-json.ts.
+const MODEL = "gpt-4o-mini";
 
 // Input cap shared across Batch-2 LLM endpoints: reject text over 10k words OR 50KB.
 const MAX_WORDS = 10000;
@@ -23,14 +29,7 @@ const SCORE_BY_OVERALL: Record<string, number> = { allow: 100, flag: 70, block: 
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const contentModeratePaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.contentModerate,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.contentModerate),
   error: "Payment required",
 };
 
@@ -41,8 +40,6 @@ contentModerateRouter.get("/content-moderate", (_req: Request, res: Response) =>
 contentModerateRouter.head("/content-moderate", (_req: Request, res: Response) => {
   res.status(402).end();
 });
-
-const anthropic = new Anthropic();
 
 function gradeFromScore(score: number): string {
   if (score >= 90) return "A";
@@ -77,34 +74,24 @@ contentModerateRouter.post("/content-moderate", async (req: Request, res: Respon
 
     let parsed: any;
     try {
-      const response = await Promise.race([
-        anthropic.messages.create({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 1024,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: "user", content: text }],
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), timeouts.contentModerate),
-        ),
-      ]);
+      const { content, usage } = await openaiJsonComplete({
+        modelId: MODEL,
+        system: SYSTEM_PROMPT,
+        user: text,
+        maxTokens: 1024,
+        timeoutMs: timeouts.contentModerate,
+      });
 
-      const textBlock = response.content.find(
-        (block): block is Anthropic.ContentBlock & { type: "text" } =>
-          block.type === "text",
-      );
-      if (!textBlock) throw new Error("no text content");
-
-      parsed = parseLooseJson(textBlock.text);
+      parsed = parseLooseJson(content);
 
       // Record token usage for per-call cost/margin logging (read at res.finish).
       res.locals.llmUsage = {
-        model: "claude-haiku-4-5-20251001",
-        inputTokens: response.usage.input_tokens,
-        outputTokens: response.usage.output_tokens,
+        model: MODEL,
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
       };
     } catch (err) {
-      if (err instanceof Anthropic.APIError || (err instanceof Error && err.message === "timeout")) {
+      if (err instanceof OpenAiCallError) {
         console.error("Content moderate LLM error:", err);
       } else {
         console.error("Content moderate parse error:", err);

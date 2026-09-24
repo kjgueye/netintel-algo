@@ -2,10 +2,12 @@ import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
 import net from "node:net";
 import dns from "node:dns/promises";
-import { timeouts, vendorRiskWeights } from "../config.js";
+import { timeouts, vendorRiskWeights, pricing } from "../config.js";
+import { signableAccepts } from "../accepts.js";
 import { runDomainAge } from "./domain-age.js";
 import { runSslAnalyze } from "./ssl.js";
 import { runDnsLookup } from "./dns.js";
+import { deliverableMxHosts } from "../utils/dns-resolvers.js";
 import { runEmailAuth } from "./email-auth.js";
 import { runIpReputation } from "./ip-reputation.js";
 import { runCertTransparency } from "./cert-transparency.js";
@@ -184,7 +186,8 @@ async function collectDns(domain: string): Promise<SignalOutcome> {
   const flags: string[] = [];
   const addrCount = r.records.A.length + r.records.AAAA.length;
   const nsCount = r.records.NS.length;
-  const mxCount = r.records.MX.length;
+  // Count only real deliverable MX — a null MX (RFC 7505) is not "MX healthy".
+  const mxCount = deliverableMxHosts(r.records.MX).length;
 
   let score: number;
   let detail: string;
@@ -310,6 +313,20 @@ const COLLECTORS: Record<SignalKey, (domain: string) => Promise<SignalOutcome>> 
 };
 
 // --- Route handler -----------------------------------------------------------
+
+// GET/HEAD return 402 so cold discovery probes see a payment challenge instead
+// of a 405 (GET-only crawlers listed this as dead/priceless). Same pattern as classify.
+const vendorRiskPaymentRequired = {
+  x402Version: 2,
+  accepts: signableAccepts(pricing.domainVendorRisk),
+  error: "Payment required",
+};
+domainVendorRiskRouter.get("/domain/vendor-risk", (_req: Request, res: Response) => {
+  res.status(402).json(vendorRiskPaymentRequired);
+});
+domainVendorRiskRouter.head("/domain/vendor-risk", (_req: Request, res: Response) => {
+  res.status(402).end();
+});
 
 domainVendorRiskRouter.post("/domain/vendor-risk", async (req: Request, res: Response) => {
   const startedAt = Date.now();

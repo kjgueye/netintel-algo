@@ -1,0 +1,1 @@
+{"timestamp":"2026-09-24T13:26:34.340Z","method":"GET","path":"/nope","query":"","reason":"unknown_route","status_code":404,"had_payment":false,"payer_wallet":"","payer_ip":"127.0.0.1","client_ua":"curl/8.5.0","referer":"","body_bytes":0,"content_type":""}

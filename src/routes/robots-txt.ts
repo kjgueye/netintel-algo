@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { validateDomain, checkSsrf, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 
 export const robotsTxtRouter = Router();
 
@@ -121,6 +122,27 @@ function parseRobotsTxt(content: string): {
   return { rules, sitemaps, host };
 }
 
+/**
+ * Robots Exclusion Protocol pattern match (RFC 9309 / Google spec): the
+ * pattern is a path prefix where `*` matches any character sequence and a
+ * trailing `$` anchors the end. Everything else is literal.
+ */
+function repPatternMatches(pattern: string, path: string): boolean {
+  const anchored = pattern.endsWith("$");
+  const body = anchored ? pattern.slice(0, -1) : pattern;
+  const regexSource =
+    "^" +
+    body.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") +
+    (anchored ? "$" : "");
+  try {
+    return new RegExp(regexSource).test(path);
+  } catch {
+    // A pathological pattern must never break the check — fall back to the
+    // literal prefix behavior.
+    return path.startsWith(pattern);
+  }
+}
+
 function checkPathPermission(
   rules: AgentRule[],
   path: string,
@@ -136,17 +158,19 @@ function checkPathPermission(
     return { path, user_agent: userAgent, allowed: true, matched_rule: null, rule_type: null };
   }
 
-  // Collect all matching rules (prefix match)
+  // Collect all matching rules. REP patterns support `*` (any sequence) and a
+  // trailing `$` (end anchor) — plain startsWith silently mis-judged paths
+  // against wildcard-heavy files like Google's (/books?*zoom=1 etc.).
   const matches: Array<{ type: "allow" | "disallow"; pattern: string }> = [];
 
   for (const pattern of agentRules.allow) {
-    if (path.startsWith(pattern)) {
+    if (repPatternMatches(pattern, path)) {
       matches.push({ type: "allow", pattern });
     }
   }
 
   for (const pattern of agentRules.disallow) {
-    if (path.startsWith(pattern)) {
+    if (repPatternMatches(pattern, path)) {
       matches.push({ type: "disallow", pattern });
     }
   }
@@ -200,19 +224,23 @@ robotsTxtRouter.get("/robots-txt/analyze", async (req: Request, res: Response) =
     let fetchError = false;
 
     try {
-      const response = await fetch(robotsUrl, {
+      // Every redirect hop is SSRF-checked before it is requested (safeFetch).
+      const response = await safeFetch(robotsUrl, {
         headers: { "User-Agent": "Mozilla/5.0 (compatible; NetIntel/1.0)" },
-        signal: AbortSignal.timeout(timeouts.robotsTxt),
-        redirect: "follow",
+        timeoutMs: timeouts.robotsTxt,
+        maxBytes: 512 * 1024,
       });
 
       statusCode = response.status;
 
       if (response.ok) {
-        rawContent = await response.text();
+        rawContent = response.text;
         found = true;
       }
-    } catch {
+    } catch (err) {
+      // A private/reserved redirect target is the route's ValidationError →
+      // uncharged 400, never a charged "fetch error" verdict.
+      if (err instanceof ValidationError) throw err;
       statusCode = 0;
       fetchError = true;
     }

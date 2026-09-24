@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import { pickRequestParam } from "../utils/field-aliases.js";
 
 export const jwtInspectorRouter = Router();
 
@@ -59,9 +60,12 @@ function calculateGrade(score: number): string {
 
 // --- Route handler ---
 
-jwtInspectorRouter.get("/jwt-inspector/decode", (req: Request, res: Response) => {
+const handleJwtDecode = (req: Request, res: Response) => {
   try {
-    const raw = req.query.token as string | undefined;
+    // A JWT is routinely a bearer credential, so it must not have to travel in
+    // the URL. Same class as the password endpoints flagged on
+    // solana-foundation/pay-skills#269, which their review did not catch.
+    const raw = pickRequestParam(req, ["token", "jwt"]);
 
     if (!raw || raw.trim() === "") {
       // Production data: 11 paid empty probes on this endpoint, ZERO later
@@ -219,4 +223,7 @@ jwtInspectorRouter.get("/jwt-inspector/decode", (req: Request, res: Response) =>
     console.error("JWT inspector error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
-});
+};
+
+jwtInspectorRouter.get("/jwt-inspector/decode", handleJwtDecode);
+jwtInspectorRouter.post("/jwt-inspector/decode", handleJwtDecode);

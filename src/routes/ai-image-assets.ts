@@ -11,6 +11,7 @@ import {
 import { isWalletDenied, logBlockedAttempt } from "../utils/abuse-controls.js";
 import { extractPayerFromRequest } from "../paid-call-logger.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
 
 const ENDPOINT_PATH = "/ai-image/generate";
 
@@ -108,6 +109,41 @@ const USE_CASES: Record<string, UseCaseSpec> = {
 const DEFAULT_USE_CASE = "web_image";
 export const SUPPORTED_USE_CASES = Object.keys(USE_CASES);
 
+// Natural shorthands → canonical use case, accepted silently (same philosophy
+// as pickRequestParam's field aliases). Learned live: the first consumer
+// integration sent use_case:"social" (2026-08-09) and fell to the generic
+// default with a warning. Keys are post-normalization (lowercased,
+// spaces/hyphens already folded to underscores).
+const USE_CASE_ALIASES: Record<string, string> = {
+  social: "social_graphic",
+  social_media: "social_graphic",
+  social_post: "social_graphic",
+  post: "social_graphic",
+  og: "og_image",
+  opengraph: "og_image",
+  open_graph: "og_image",
+  link_preview: "og_image",
+  icon: "app_icon",
+  thumbnail: "blog_thumbnail",
+  thumb: "blog_thumbnail",
+  hero: "banner",
+  header: "banner",
+  cover: "banner",
+  profile: "avatar",
+  profile_picture: "avatar",
+  profile_pic: "avatar",
+  pfp: "avatar",
+  product: "product_mockup",
+  mockup: "product_mockup",
+  logomark: "logo",
+  logo_mark: "logo",
+  drawing: "illustration",
+  sticker: "illustration",
+  art: "illustration",
+  image: "web_image",
+  picture: "web_image",
+};
+
 // --- Aspect ratios → provider size -----------------------------------------
 export type AspectRatio = "1:1" | "16:9" | "9:16";
 // Provider sizes are gpt-image-1's supported set (1024x1024, 1536x1024,
@@ -155,6 +191,8 @@ export function resolveUseCase(input: unknown): { useCase: string; warning?: str
   }
   const key = input.trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (USE_CASES[key]) return { useCase: key };
+  const aliased = USE_CASE_ALIASES[key];
+  if (aliased) return { useCase: aliased };
   return {
     useCase: DEFAULT_USE_CASE,
     warning: `unknown use_case "${input}"; defaulted to web_image (supported: ${SUPPORTED_USE_CASES.join(", ")})`,
@@ -218,14 +256,7 @@ export function priceBlock(priceStr: string): { amount: string; currency: string
 // --- GET/HEAD 402 stubs (so the Bazaar prober sees a challenge, not a 404) ---
 const aiImageAssetsPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.aiImageAssets,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.aiImageAssets),
   error: "Payment required",
 };
 
@@ -468,12 +499,29 @@ aiImageAssetsRouter.post("/ai-image/generate", async (req: Request, res: Respons
       throw err;
     }
 
+    // Fold the render's token usage in ahead of the Claude metadata usage the
+    // step-1 stash recorded: the image is the dominant cost (~$0.06-0.08 vs
+    // ~$0.002) and was invisible to cost_usdc before — the first live call
+    // (2026-08-08) logged a ~99% margin that was really ~65-70%. The image
+    // entry goes FIRST so meta.model reads gpt-image-1.
+    const claudeUsage = res.locals.llmUsage;
+    if (result.usage && claudeUsage && !Array.isArray(claudeUsage)) {
+      res.locals.llmUsage = [
+        { model: result.model, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens },
+        claudeUsage,
+      ];
+    }
+
     const score = meta.score;
     // De-dup warnings while preserving order.
     const dedupedWarnings = [...new Set(warnings)];
 
+    // Field order is deliberate: metadata FIRST, the multi-megabyte data URI
+    // LAST. The paid-call logger stores only a ~1KB response prefix, and with
+    // image_url first that prefix was pure base64 — no revised_prompt, score,
+    // or warnings ever reached the log, leaving zero quality audit trail on an
+    // endpoint whose output we (rightly) never persist.
     res.json({
-      image_url: result.imageUrl,
       // Prefer the provider's own revised prompt; fall back to our optimized one.
       revised_prompt: result.revisedPrompt || meta.optimized_prompt,
       use_case: useCase,
@@ -492,6 +540,7 @@ aiImageAssetsRouter.post("/ai-image/generate", async (req: Request, res: Respons
       disclaimer:
         "Generated images are not guaranteed to be copyright- or trademark-safe. Review before commercial use. image_url is a base64 PNG data URI (self-contained, no expiry).",
       price: priceBlock(pricing.aiImageAssets),
+      image_url: result.imageUrl,
     });
   } catch (err) {
     if (err instanceof ValidationError) {

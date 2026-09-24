@@ -37,7 +37,7 @@ const CRYPTO_ALIAS: Record<string, string> = { CELO: "CGLD" };
 // Round to a fixed money precision: 2 decimals for fiat (in the ECB set), and
 // ~8 significant figures for crypto/other so tiny amounts (e.g. USD→BTC) don't
 // collapse to 0.00.
-function roundMoney(value: number, currency: string): number {
+export function roundMoney(value: number, currency: string): number {
   if (SUPPORTED_CURRENCIES.has(currency)) return Math.round(value * 100) / 100;
   return roundSig(value);
 }
@@ -302,6 +302,79 @@ async function tryCoinGeckoFallback(
     // Network/timeout or a metadata fetch that came back non-2xx (e.g. 429).
     return { status: "failed", reason: `upstream_error:${err instanceof Error ? err.message : "unknown"}` };
   }
+}
+
+// --- Reusable rate lookup (imported by sibling routes) ---------------------
+//
+// The same rate machinery the handler below uses — ECB for fiat↔fiat, Coinbase
+// spot for crypto, CoinGecko for the long tail — exposed as a plain function so
+// /money/normalize can convert an amount WITHOUT re-implementing rates and
+// WITHOUT an HTTP call back into this service. It shares the 60s rate cache, the
+// SSRF guard, and the ticker aliases; only the Express-specific parts (status
+// codes, findings, historical dates) stay in the handler.
+//
+// Latest spot only: a caller that needs a historical date wants the endpoint.
+
+/** No rate could be obtained for the pair (unknown ticker or upstream failure). */
+export class RateUnavailableError extends Error {}
+
+export interface RateQuote {
+  /** Value of 1 `from` unit expressed in `to`. */
+  rate: number;
+  /** YYYY-MM-DD the rate is dated. */
+  rate_date: string;
+  source: "same" | "ecb" | "coinbase" | "coingecko";
+}
+
+function today(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+/** Latest rate for a currency pair. Throws RateUnavailableError if unavailable. */
+export async function getRateQuote(from: string, to: string): Promise<RateQuote> {
+  const fromUpper = from.toUpperCase();
+  const toUpper = to.toUpperCase();
+
+  if (fromUpper === toUpper) return { rate: 1, rate_date: today(), source: "same" };
+
+  if (SUPPORTED_CURRENCIES.has(fromUpper) && SUPPORTED_CURRENCIES.has(toUpper)) {
+    await checkSsrf("api.frankfurter.dev");
+    const r = await cachedFetchJson(
+      `https://api.frankfurter.dev/v1/latest?from=${fromUpper}&to=${toUpper}`,
+      timeouts.currencyExchange,
+    );
+    if (!r.ok) throw new RateUnavailableError(`rate provider unavailable (HTTP ${r.status})`);
+    const data = r.data as { date?: string; rates?: Record<string, number> };
+    const rate = data?.rates?.[toUpper];
+    if (typeof rate !== "number" || !isFinite(rate) || rate <= 0) {
+      throw new RateUnavailableError(`no rate returned for ${toUpper}`);
+    }
+    return { rate, rate_date: data.date ?? today(), source: "ecb" };
+  }
+
+  await checkSsrf("api.coinbase.com");
+  const cb = await cachedFetchJson(
+    `https://api.coinbase.com/v2/exchange-rates?currency=${encodeURIComponent(CRYPTO_ALIAS[fromUpper] ?? fromUpper)}`,
+    timeouts.currencyExchange,
+  );
+  if (cb.ok) {
+    const rates = (cb.data as { data?: { rates?: Record<string, string> } })?.data?.rates ?? {};
+    const rateStr = rates[CRYPTO_ALIAS[toUpper] ?? toUpper] ?? rates[toUpper];
+    const rate = Number(rateStr);
+    if (rateStr !== undefined && isFinite(rate) && rate > 0) {
+      return { rate, rate_date: today(), source: "coinbase" };
+    }
+  }
+
+  const fb = await tryCoinGeckoFallback(fromUpper, toUpper, 1);
+  if (fb.status === "ok") {
+    const rate = Number(fb.body.exchange_rate);
+    if (isFinite(rate) && rate > 0) {
+      return { rate, rate_date: String(fb.body.rate_date ?? today()), source: "coingecko" };
+    }
+  }
+
+  throw new RateUnavailableError(`no rate available for ${fromUpper}→${toUpper}`);
 }
 
 // --- Route handler ---

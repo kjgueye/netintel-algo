@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { config, pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { pickField } from "../utils/field-aliases.js";
+import { signableAccepts } from "../accepts.js";
 
 export const moneyParseRouter = Router();
 
@@ -434,14 +435,7 @@ function buildResponse(a: BuildArgs) {
 
 const moneyParsePaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.moneyParse,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.moneyParse),
   error: "Payment required",
 };
 

@@ -4,6 +4,7 @@ import tls from "node:tls";
 import { timeouts } from "../config.js";
 import { checkSsrf, validateDomain, ValidationError } from "../utils/validators.js";
 import { isDnsblListing, queryDns, resolveTxt } from "../utils/dns-resolvers.js";
+import { safeFetch } from "../utils/safe-fetch.js";
 
 export const domainReportRouter = Router();
 
@@ -287,7 +288,11 @@ async function sslCheck(domain: string): Promise<SslSection> {
 
     return {
       available: true,
-      issuer: getCertField(cert.issuer, "O") ?? getCertField(cert.issuer, "CN"),
+      // CN first, O fallback — the same precedence as /domain-report/full and
+      // /ssl/analyze. The old O-first read made the two reports name different
+      // issuers for the same cert ("SSL Corporation" vs "Cloudflare TLS
+      // Issuing ECC CA 3"; 2026-07-30 sweep audit).
+      issuer: getCertField(cert.issuer, "CN") ?? getCertField(cert.issuer, "O"),
       valid_from: toIso(cert.valid_from),
       valid_to: toIso(cert.valid_to),
       days_until_expiry: daysUntilExpiry,
@@ -337,19 +342,15 @@ function detectWaf(headers: Headers): string | null {
 async function techCheck(domain: string): Promise<TechSection> {
   try {
     await checkSsrf(domain);
-    const res = await fetch(`https://${domain}`, {
-      method: "GET",
-      redirect: "follow",
-      signal: AbortSignal.timeout(timeouts.domainReport),
+    // Every redirect hop is SSRF-checked before it is requested; the body read
+    // is capped at MAX_BODY_BYTES under the same deadline. Any failure —
+    // including a blocked hop — leaves this one section empty (TECH_EMPTY).
+    const res = await safeFetch(`https://${domain}`, {
       headers: { "User-Agent": USER_AGENT },
+      timeoutMs: timeouts.domainReport,
+      maxBytes: MAX_BODY_BYTES,
     });
-
-    let html = "";
-    try {
-      html = (await res.text()).slice(0, MAX_BODY_BYTES);
-    } catch {
-      // Body unavailable — header-based detections still apply
-    }
+    const html = res.text.slice(0, MAX_BODY_BYTES);
 
     return {
       available: true,

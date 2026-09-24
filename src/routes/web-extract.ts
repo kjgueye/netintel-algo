@@ -1,5 +1,8 @@
 import { Router, type Request, type Response } from "express";
-import { validateUrl, checkSsrf, ValidationError } from "../utils/validators.js";
+import { validateUrl, ValidationError } from "../utils/validators.js";
+import { describeFetchFailure } from "../utils/fetch-failure.js";
+import { safeFetch, FetchProblem } from "../utils/safe-fetch.js";
+import { assessSource } from "../utils/source-usability.js";
 import { timeouts } from "../config.js";
 // pdf-parse ships no type declarations, and its package entrypoint (index.js)
 // runs debug code on import that reads a bundled test PDF off disk — which
@@ -27,7 +30,7 @@ const INPUT_READ_CAP = 5 * 1024 * 1024;
 const OUTPUT_BYTE_CAP = 1024 * 1024; // 1,048,576 bytes
 const MAX_REDIRECTS = 3;
 
-// --- Fetch (manual redirect handling so we can cap hops + SSRF-check each one) ---
+// --- Fetch (shared hop-checked fetcher: caps redirects + SSRF-checks each one) ---
 
 interface FetchResult {
   status: number;
@@ -36,63 +39,14 @@ interface FetchResult {
   bytes: Buffer;
 }
 
-// The express `Response` type is imported above and shadows the global fetch
-// `Response`; recover the fetch one from the global fetch signature.
-type FetchResponse = Awaited<ReturnType<typeof fetch>>;
-
-async function readCapped(resp: FetchResponse, cap: number): Promise<Buffer> {
-  const reader = resp.body?.getReader?.();
-  if (!reader) {
-    const ab = await resp.arrayBuffer();
-    return Buffer.from(ab).subarray(0, cap);
-  }
-  const chunks: Buffer[] = [];
-  let total = 0;
-  while (total < cap) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(Buffer.from(value));
-    total += value.length;
-  }
-  reader.cancel().catch(() => {});
-  const combined = Buffer.concat(chunks);
-  return combined.length > cap ? combined.subarray(0, cap) : combined;
-}
-
 async function fetchPage(start: URL): Promise<FetchResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeouts.webExtract);
-  try {
-    let current = start;
-    for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-      // SSRF-check every hop — a redirect can point at an internal address.
-      await checkSsrf(current.hostname);
-
-      const resp = await fetch(current.href, {
-        method: "GET",
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; NetIntel/1.0)" },
-        redirect: "manual",
-        signal: controller.signal,
-      });
-
-      const status = resp.status;
-      const location = resp.headers.get("location");
-
-      if (status >= 300 && status < 400 && location && hop < MAX_REDIRECTS) {
-        resp.body?.cancel?.().catch(() => {});
-        current = new URL(location, current.href);
-        continue;
-      }
-
-      const contentType = resp.headers.get("content-type") || "";
-      const bytes = await readCapped(resp, INPUT_READ_CAP);
-      return { status, finalUrl: resp.url || current.href, contentType, bytes };
-    }
-    // Unreachable: the loop always returns on the final (non-redirect) hop.
-    throw new Error("redirect handling fell through");
-  } finally {
-    clearTimeout(timer);
-  }
+  const r = await safeFetch(start, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; NetIntel/1.0)" },
+    timeoutMs: timeouts.webExtract,
+    maxRedirects: MAX_REDIRECTS,
+    maxBytes: INPUT_READ_CAP,
+  });
+  return { status: r.status, finalUrl: r.finalUrl, contentType: r.contentType, bytes: r.bytes };
 }
 
 // --- HTML helpers (extends the page-extract approach, but emits Markdown) ---
@@ -244,6 +198,11 @@ function collapseMarkdown(md: string): string {
 
 function htmlToMarkdown(html: string, baseUrl: string): string {
   let s = html;
+
+  // 0 — Normalize CRLF/CR to LF. Every collapse below matches \n only, so
+  // stray \r from CRLF-served pages (e.g. sitemaps.org) leaked "\r\n\r\n"
+  // runs into the output (2026-07-30 sweep audit).
+  s = s.replace(/\r\n?/g, "\n");
 
   // 1 — Drop comments + noise blocks (tag + contents).
   s = s.replace(/<!--[\s\S]*?-->/g, "");
@@ -410,14 +369,25 @@ webExtractRouter.get("/web/extract", async (req: Request, res: Response) => {
       page = await fetchPage(parsed);
     } catch (err) {
       if (err instanceof ValidationError) throw err; // SSRF / resolution → 400 below
+      if (err instanceof FetchProblem) {
+        // Refused redirect (non-http scheme / too many hops / bad Location) → its own uncharged status.
+        res.status(err.status).json({ error: err.message, code: err.code });
+        return;
+      }
       const name = (err as { name?: string })?.name;
       if (name === "AbortError" || name === "TimeoutError") {
         res.status(504).json({ error: "Upstream fetch timed out" });
         return;
       }
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("Web extract fetch failed:", message);
-      res.status(502).json({ error: `Upstream fetch failed: ${message}` });
+      // Node reports every transport failure as the same opaque
+      // "TypeError: fetch failed"; the real reason is on err.cause. Surfacing
+      // only the outer message told a paying caller nothing — an expired
+      // certificate, a DNS failure and our own service being down all read
+      // identically, and "fetch failed" reads as OUR fault. See
+      // src/utils/fetch-failure.ts.
+      const failure = describeFetchFailure(err);
+      console.error("Web extract fetch failed:", failure.reason, err);
+      res.status(502).json({ ...failure, url: parsed.href });
       return;
     }
 
@@ -470,6 +440,36 @@ webExtractRouter.get("/web/extract", async (req: Request, res: Response) => {
 
     const wordCount = countWords(markdown);
     const outputBytes = Buffer.byteLength(markdown, "utf8");
+
+    // Never bill for a miss: a bot challenge, a 404, or an empty extraction has
+    // nothing to sell. A graded-down 200 would still settle the payment (x402
+    // settles on <400) and would hand the agent the interstitial's title as if
+    // it were the document's. Answer 4xx instead — uncharged.
+    const unusable = assessSource({
+      status: page.status,
+      title,
+      body: looksHtml ? page.bytes.toString("utf8") : markdown,
+      contentUnits: wordCount,
+      noun: "content",
+      // A 401/403/429/503 that yields under 40 words is a refusal remnant, not
+      // the document (the grader already calls <100 words "thin"; 40 is well
+      // below any real article) — uncharged instead of a billed C-grade.
+      thinFloor: 40,
+      // JS-rendered / bot-walled pages are /exa/contents' job, not ours; point
+      // the caller there rather than leaving a dead end.
+      suggestRenderer: true,
+    });
+    if (unusable) {
+      res.status(unusable.status).json({
+        error: unusable.error,
+        code: unusable.code,
+        ...(unusable.hint ? { hint: unusable.hint } : {}),
+        url: parsed.href,
+        final_url: page.finalUrl,
+        status_code: page.status,
+      });
+      return;
+    }
 
     // --- Grading ---
     let score = 100;

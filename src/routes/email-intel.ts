@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import dns from "node:dns/promises";
+import { assessMx } from "../utils/dns-resolvers.js";
 
 export const emailIntelRouter = Router();
 
@@ -75,7 +75,15 @@ export interface EmailIntelResult {
   deliverability: string;
   score: number;
   grade: string;
-  findings: string[];
+  findings: EmailIntelFinding[];
+}
+
+// Same {rule, deduction, detail} shape every other endpoint uses — email-intel
+// was the one route emitting findings as bare strings (2026-07-30 sweep audit).
+export interface EmailIntelFinding {
+  rule: string;
+  deduction: number;
+  detail: string;
 }
 
 /**
@@ -91,59 +99,88 @@ export async function runEmailIntel(email: string): Promise<EmailIntelResult> {
   const domain = atIndex !== -1 ? email.slice(atIndex + 1).toLowerCase() : "";
 
   let score = 100;
-  const findings: string[] = [];
+  const findings: EmailIntelFinding[] = [];
 
   // Format check
   if (!formatValid) {
     score -= 60;
-    findings.push("invalid_format");
+    findings.push({
+      rule: "invalid_format",
+      deduction: -60,
+      detail: "Address does not match a valid email format",
+    });
   }
 
-  // MX lookup
+  // MX lookup. assessMx filters an RFC 7505 null MX (MX 0 ".") — an explicit
+  // "this domain accepts no mail" — so it is NOT counted as a deliverable MX.
+  // (Before this, a null MX like example.com's graded "deliverable A/100".)
   let mxRecordsFound = false;
   let mxRecords: string[] = [];
+  let nullMx = false;
 
   if (formatValid && domain) {
-    try {
-      const mxResult = await dns.resolveMx(domain);
-      if (mxResult && mxResult.length > 0) {
-        mxRecordsFound = true;
-        mxRecords = mxResult
-          .sort((a, b) => a.priority - b.priority)
-          .map((r) => r.exchange);
-      }
-    } catch {
-      // No MX records or DNS failure
-    }
+    const mx = await assessMx(domain);
+    mxRecords = mx.deliverableHosts;
+    mxRecordsFound = mx.deliverableHosts.length > 0;
+    nullMx = mx.nullMx;
   }
 
   if (formatValid && !mxRecordsFound) {
     score -= 40;
-    findings.push("no_mx_records");
+    // Distinguish an explicit null MX from a plain absence — both are
+    // undeliverable, but a null MX means the domain deliberately rejects mail.
+    findings.push(
+      nullMx
+        ? {
+            rule: "null_mx",
+            deduction: -40,
+            detail: "Domain publishes an RFC 7505 null MX — it deliberately accepts no mail",
+          }
+        : {
+            rule: "no_mx_records",
+            deduction: -40,
+            detail: "No MX records found — mail cannot be delivered to this domain",
+          }
+    );
   }
 
   // Disposable check
   const isDisposable = DISPOSABLE_DOMAINS.has(domain);
   if (isDisposable) {
     score -= 50;
-    findings.push("is_disposable");
+    findings.push({
+      rule: "is_disposable",
+      deduction: -50,
+      detail: "Domain is a known disposable/temporary email provider",
+    });
   }
 
   // Role-based check
   const isRoleBased = ROLE_PREFIXES.has(localPart);
   if (isRoleBased) {
     score -= 20;
-    findings.push("is_role_based");
+    findings.push({
+      rule: "is_role_based",
+      deduction: -20,
+      detail: "Local part is a role address (info@, admin@, …), not a person",
+    });
   }
 
   // Free provider check
   const isFreeProvider = FREE_DOMAINS.has(domain);
   if (isFreeProvider) {
     score -= 10;
-    findings.push("is_free_provider");
+    findings.push({
+      rule: "is_free_provider",
+      deduction: -10,
+      detail: "Domain is a free consumer email provider",
+    });
   }
 
-  const isBusinessEmail = formatValid && !isFreeProvider && !isDisposable;
+  // A working business address must also be able to RECEIVE mail — the old
+  // check called undeliverable test@example.org a business email (2026-07-30
+  // sweep audit).
+  const isBusinessEmail = formatValid && mxRecordsFound && !isFreeProvider && !isDisposable;
 
   // Score floor
   score = Math.max(0, score);

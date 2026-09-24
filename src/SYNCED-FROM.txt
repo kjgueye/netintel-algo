@@ -1,5 +1,7 @@
-src/routes and src/utils are VERBATIM copies from the NetIntel (Base) repo.
-Do not hand-edit them — edits belong in src/config.ts or src/index.ts, or
-upstream in NetIntel. Regenerate with: npm run sync:from-netintel
+src/routes, src/utils, src/services, src/netintel-config.ts, src/mirror-402-body.ts,
+src/payment-headers.ts and src/service-metadata.ts are VERBATIM copies from the
+NetIntel (Base) repo; src/route-table.ts is generated from its src/index.ts.
+Do not hand-edit them — edits belong in src/config.ts, src/accepts.ts or
+src/index.ts, or upstream in NetIntel. Regenerate with: npm run sync:from-netintel
 
-netintel-commit: a083a2d7d6d22145e7b8c3f57dbc0f054287e8e5
+netintel-commit: 9f4c185892a9b1fe0606509ca33c82f8c9951962

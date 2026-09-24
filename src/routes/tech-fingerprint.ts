@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { timeouts } from "../config.js";
 import { checkSsrf, validateUrl, ValidationError } from "../utils/validators.js";
 import { pickRequestParam } from "../utils/field-aliases.js";
+import { safeFetch, FetchProblem } from "../utils/safe-fetch.js";
 
 export const techFingerprintRouter = Router();
 
@@ -284,41 +285,28 @@ export async function runTechFingerprint(target: string): Promise<TechFingerprin
   let responseHeaders: Headers;
   let html = "";
 
-  const headRes = await fetch(parsedUrl.toString(), {
+  // Every redirect hop is SSRF-checked before it is requested (safeFetch).
+  const headRes = await safeFetch(parsedUrl, {
     method: "HEAD",
-    redirect: "follow",
-    signal: AbortSignal.timeout(timeouts.techFingerprint),
     headers: { "User-Agent": USER_AGENT },
+    timeoutMs: timeouts.techFingerprint,
   });
   statusCode = headRes.status;
   responseHeaders = headRes.headers;
 
   try {
-    const getRes = await fetch(parsedUrl.toString(), {
-      method: "GET",
-      redirect: "follow",
-      signal: AbortSignal.timeout(timeouts.techFingerprint),
+    const getRes = await safeFetch(parsedUrl, {
       headers: { "User-Agent": USER_AGENT },
+      timeoutMs: timeouts.techFingerprint,
+      maxBytes: MAX_BODY_BYTES,
     });
     statusCode = getRes.status;
     responseHeaders = getRes.headers;
-
-    const reader = getRes.body?.getReader();
-    if (reader) {
-      const chunks: Uint8Array[] = [];
-      let totalSize = 0;
-      while (totalSize < MAX_BODY_BYTES) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        totalSize += value.length;
-      }
-      reader.cancel().catch(() => {});
-      const decoder = new TextDecoder();
-      html = chunks.map((c) => decoder.decode(c, { stream: true })).join("");
-      html = html.slice(0, MAX_BODY_BYTES);
-    }
-  } catch {
+    html = getRes.text.slice(0, MAX_BODY_BYTES);
+  } catch (err) {
+    // A private/reserved redirect target is a block, not a transport hiccup —
+    // surface it (the aggregator marks the section failed, uncharged).
+    if (err instanceof ValidationError) throw err;
     // If GET fails, proceed with HEAD data only.
   }
 
@@ -380,51 +368,43 @@ techFingerprintRouter.get("/tech-fingerprint/analyze", async (req: Request, res:
     let responseHeaders: Headers;
     let html = "";
 
-    // HEAD request first for headers
+    // HEAD request first for headers (every redirect hop SSRF-checked)
     try {
-      const headRes = await fetch(parsedUrl.toString(), {
+      const headRes = await safeFetch(parsedUrl, {
         method: "HEAD",
-        redirect: "follow",
-        signal: AbortSignal.timeout(timeouts.techFingerprint),
         headers: { "User-Agent": USER_AGENT },
+        timeoutMs: timeouts.techFingerprint,
       });
       statusCode = headRes.status;
       responseHeaders = headRes.headers;
     } catch (err) {
+      // A private/reserved redirect target → the outer ValidationError → 400.
+      if (err instanceof ValidationError) throw err;
+      if (err instanceof FetchProblem) {
+        res.status(err.status).json({ error: err.message, code: err.code });
+        return;
+      }
       const message = err instanceof Error ? err.message : String(err);
       res.status(500).json({ error: `Technology fingerprint failed: ${message}` });
       return;
     }
 
-    // GET request for body
+    // GET request for body, capped at MAX_BODY_BYTES (every hop SSRF-checked)
     try {
-      const getRes = await fetch(parsedUrl.toString(), {
-        method: "GET",
-        redirect: "follow",
-        signal: AbortSignal.timeout(timeouts.techFingerprint),
+      const getRes = await safeFetch(parsedUrl, {
         headers: { "User-Agent": USER_AGENT },
+        timeoutMs: timeouts.techFingerprint,
+        maxBytes: MAX_BODY_BYTES,
       });
       statusCode = getRes.status;
       responseHeaders = getRes.headers;
-
-      // Read body up to MAX_BODY_BYTES
-      const reader = getRes.body?.getReader();
-      if (reader) {
-        const chunks: Uint8Array[] = [];
-        let totalSize = 0;
-        while (totalSize < MAX_BODY_BYTES) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          chunks.push(value);
-          totalSize += value.length;
-        }
-        reader.cancel().catch(() => {});
-        const decoder = new TextDecoder();
-        html = chunks.map((c) => decoder.decode(c, { stream: true })).join("");
-        html = html.slice(0, MAX_BODY_BYTES);
-      }
-    } catch {
-      // If GET fails, we still have HEAD data — proceed with what we have
+      html = getRes.text.slice(0, MAX_BODY_BYTES);
+    } catch (err) {
+      // A private/reserved redirect target → the outer ValidationError → 400;
+      // never "proceed with HEAD data" past a blocked hop.
+      if (err instanceof ValidationError) throw err;
+      // Otherwise (transport error, timeout, redirect problem) we still have
+      // HEAD data — proceed with what we have, as before.
     }
 
     const responseTimeMs = Date.now() - start;

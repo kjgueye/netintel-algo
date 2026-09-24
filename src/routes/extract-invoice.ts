@@ -1,8 +1,8 @@
 import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
-import Anthropic from "@anthropic-ai/sdk";
-import { config, pricing, timeouts } from "../config.js";
-import { checkSsrf, fmtReceived, validateUrl, ValidationError } from "../utils/validators.js";
+import { pricing, timeouts } from "../config.js";
+import { fmtReceived, validateUrl, ValidationError } from "../utils/validators.js";
+import { safeFetch, FetchProblem, isTimeoutError, type SafeFetchResult } from "../utils/safe-fetch.js";
 // pdf-parse ships no type declarations, and its package entrypoint (index.js)
 // runs debug code on import that reads a bundled test PDF off disk — which
 // throws under ESM where `module.parent` is undefined. Import the library
@@ -10,6 +10,8 @@ import { checkSsrf, fmtReceived, validateUrl, ValidationError } from "../utils/v
 // @ts-ignore -- no types for the lib subpath
 import pdfParse from "pdf-parse/lib/pdf-parse.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
+import { openaiJsonComplete, OpenAiCallError } from "../services/openai-json.js";
 
 export const extractInvoiceRouter = Router();
 
@@ -23,6 +25,11 @@ const MAX_BYTES = 50 * 1024;
 // Invoices have variable-length line-item lists — give the model room so a long
 // itemized invoice does not get truncated mid-array.
 const MAX_TOKENS = 2048;
+
+// Swapped from Anthropic Haiku to gpt-4o-mini 2026-09-02 (see the pricing
+// deep-dive / src/services/openai-json.ts); the shared helper self-manages the
+// wall-clock timeout and aborts the upstream request.
+const MODEL = "gpt-4o-mini";
 
 // Sum of line-item amounts + tax must land within $0.02 of the stated total for
 // the invoice to "reconcile".
@@ -97,14 +104,7 @@ type InvoiceFields = {
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const extractInvoicePaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.extractInvoice,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.extractInvoice),
   error: "Payment required",
 };
 
@@ -115,8 +115,6 @@ extractInvoiceRouter.get("/extract/invoice", (_req: Request, res: Response) => {
 extractInvoiceRouter.head("/extract/invoice", (_req: Request, res: Response) => {
   res.status(402).end();
 });
-
-const anthropic = new Anthropic();
 
 function gradeFromScore(score: number): string {
   if (score >= 90) return "A";
@@ -150,89 +148,43 @@ function parseLineItems(value: unknown): LineItem[] {
   });
 }
 
+// gpt-4o-mini runs in response_format:json_object mode (via openaiJsonComplete),
+// which requires the word "json" in the prompt and — unlike the previous Anthropic
+// structured-output schema — no longer constrains the shape, so the prompt now
+// enumerates the exact keys the parser reads. parseLooseJson + the defensive
+// "not an object" guard cover any malformed reply.
 const SYSTEM_PROMPT =
   "You are a precise invoice and receipt data extraction engine. Extract structured data from the invoice or receipt text the user provides. " +
+  "Respond with ONLY a JSON object (no preamble, no markdown, no code fences) with exactly these keys: " +
+  '{"vendor": str|null, "invoice_number": str|null, "invoice_date": str|null, "due_date": str|null, ' +
+  '"line_items": [ {"description": str|null, "quantity": number|null, "unit_price": number|null, "amount": number|null} ], ' +
+  '"subtotal": number|null, "tax": number|null, "total": number|null, "currency": str|null}. ' +
   "Numbers must be numbers, not strings. Dates as ISO 8601 (YYYY-MM-DD) where possible. line_items is an empty array if none are found. Use null for any field that is not present. Do not invent values. " +
   "If the text contains no invoice or receipt content at all (e.g. it is an instruction, question, or unrelated prose), set every field to null and line_items to []. This is an extraction task: always parse whatever is submitted, never refuse.";
-
-// Structured-output schema (output_config.format). The API constrains the
-// response to conform, so "model output could not be parsed" is structurally
-// impossible — the failure class behind the live 502s this replaced (a caller
-// sent an instruction instead of an invoice; the model answered in prose;
-// JSON.parse failed twice; 3.2s + two Haiku calls wasted per request).
-// Structured outputs require additionalProperties:false and all keys required
-// — nullability carries the "not present" signal instead of key absence.
-const INVOICE_OUTPUT_SCHEMA = {
-  type: "object",
-  properties: {
-    vendor: { type: ["string", "null"] },
-    invoice_number: { type: ["string", "null"] },
-    invoice_date: { type: ["string", "null"] },
-    due_date: { type: ["string", "null"] },
-    line_items: {
-      type: "array",
-      items: {
-        type: "object",
-        properties: {
-          description: { type: ["string", "null"] },
-          quantity: { type: ["number", "null"] },
-          unit_price: { type: ["number", "null"] },
-          amount: { type: ["number", "null"] },
-        },
-        required: ["description", "quantity", "unit_price", "amount"],
-        additionalProperties: false,
-      },
-    },
-    subtotal: { type: ["number", "null"] },
-    tax: { type: ["number", "null"] },
-    total: { type: ["number", "null"] },
-    currency: { type: ["string", "null"] },
-  },
-  required: [
-    "vendor",
-    "invoice_number",
-    "invoice_date",
-    "due_date",
-    "line_items",
-    "subtotal",
-    "tax",
-    "total",
-    "currency",
-  ],
-  additionalProperties: false,
-};
 
 // Result of a single attempt: either parsed fields, or a signal that the call was truncated.
 type AttemptResult =
   | { ok: true; fields: InvoiceFields; usage: { inputTokens: number; outputTokens: number } }
   | { ok: false; truncated: true };
 
-async function attemptExtract(text: string, signal: AbortSignal): Promise<AttemptResult> {
-  const response = await anthropic.messages.create(
-    {
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      // Guaranteed schema-conforming JSON — see INVOICE_OUTPUT_SCHEMA.
-      output_config: { format: { type: "json_schema", schema: INVOICE_OUTPUT_SCHEMA } },
-      messages: [{ role: "user", content: text }],
-    },
-    { signal },
-  );
+async function attemptExtract(text: string): Promise<AttemptResult> {
+  // openaiJsonComplete self-manages a hard wall-clock timeout (aborts the
+  // upstream request) — no caller-supplied AbortSignal needed.
+  const { content, usage, truncated } = await openaiJsonComplete({
+    modelId: MODEL,
+    system: SYSTEM_PROMPT,
+    user: text,
+    maxTokens: MAX_TOKENS,
+    timeoutMs: timeouts.extractInvoice,
+  });
 
-  // Truncation guard: if the model hit max_tokens the output may be partial/invalid.
+  // Truncation guard: if the model hit the output cap the JSON may be partial/invalid.
   // Treat as a failed extraction (502), never parse/return partial JSON as a 200.
-  // Applied on BOTH the initial call and the retry.
-  if (response.stop_reason === "max_tokens") {
+  if (truncated) {
     return { ok: false, truncated: true };
   }
 
-  const textBlock = response.content.find(
-    (block): block is Anthropic.ContentBlock & { type: "text" } => block.type === "text",
-  );
-  if (!textBlock) throw new Error("no text content");
-
-  const parsed = parseLooseJson(textBlock.text);
+  const parsed = parseLooseJson(content);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("not an object");
   }
@@ -252,8 +204,8 @@ async function attemptExtract(text: string, signal: AbortSignal): Promise<Attemp
       currency: asStringOrNull(p.currency),
     },
     usage: {
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
     },
   };
 }
@@ -269,37 +221,6 @@ type SourceInfo = {
 };
 
 const TEXT_SOURCE: SourceInfo = { type: "text", url: null, content_type: null };
-
-// The express `Response` type shadows the global fetch `Response`; recover the
-// fetch one from the global fetch signature.
-type FetchResponse = Awaited<ReturnType<typeof fetch>>;
-
-async function readBodyCapped(
-  resp: FetchResponse,
-  cap: number,
-): Promise<{ bytes: Buffer; exceeded: boolean }> {
-  const reader = resp.body?.getReader?.();
-  if (!reader) {
-    const ab = await resp.arrayBuffer();
-    const buf = Buffer.from(ab);
-    return { bytes: buf.subarray(0, cap), exceeded: buf.length > cap };
-  }
-  const chunks: Buffer[] = [];
-  let total = 0;
-  let exceeded = false;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(Buffer.from(value));
-    total += value.length;
-    if (total > cap) {
-      exceeded = true;
-      break;
-    }
-  }
-  reader.cancel().catch(() => {});
-  return { bytes: Buffer.concat(chunks), exceeded };
-}
 
 // Regex-strip HTML down to plain text. Deliberately simple — invoices don't
 // need document structure, only their visible text (amounts, dates, vendor).
@@ -328,8 +249,8 @@ type FetchedDoc =
   | { ok: true; text: string; contentType: "pdf" | "html" | "text" }
   | { ok: false; status: number; body: { error: string; code: string } };
 
-// Cap redirect hops (matches web-extract). Each hop is independently
-// SSRF-checked, so a redirect chain can't smuggle in an internal address.
+// Cap redirect hops (matches web-extract). safeFetch SSRF-checks each hop
+// before requesting it, so a redirect chain can't smuggle in an internal address.
 const MAX_FETCH_REDIRECTS = 3;
 
 async function fetchInvoiceDocument(rawUrl: string): Promise<FetchedDoc> {
@@ -337,77 +258,62 @@ async function fetchInvoiceDocument(rawUrl: string): Promise<FetchedDoc> {
   // validateUrl enforces http(s) + throws ValidationError (→ instructive 400).
   const parsed = validateUrl(rawUrl);
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeouts.extractInvoiceFetch);
-  let resp: FetchResponse;
-  let read: { bytes: Buffer; exceeded: boolean };
-  let current = parsed;
+  let fetched: SafeFetchResult;
   try {
-    // Manual redirect handling so EVERY hop is SSRF-checked — a public URL that
-    // 302-redirects to 169.254.169.254 (cloud metadata) or an RFC-1918 host
-    // would otherwise be followed unchecked. Same pattern as web-extract.
-    for (let hop = 0; ; hop++) {
-      await checkSsrf(current.hostname);
-
-      resp = await fetch(current.href, {
-        redirect: "manual",
-        signal: controller.signal,
-        headers: { accept: "application/pdf, text/html, text/plain, */*" },
-      });
-
-      const location = resp.headers.get("location");
-      if (resp.status >= 300 && resp.status < 400 && location) {
-        resp.body?.cancel?.().catch(() => {});
-        if (hop >= MAX_FETCH_REDIRECTS) {
-          return {
-            ok: false,
-            status: 502,
-            body: { error: "Could not fetch url — too many redirects", code: "UPSTREAM_ERROR" },
-          };
-        }
-        // new URL(location, base) is re-checked at the top of the next hop.
-        current = new URL(location, current.href);
-        continue;
-      }
-
-      if (resp.status < 200 || resp.status >= 300) {
-        return {
-          ok: false,
-          status: 502,
-          body: {
-            error: `Could not fetch url — upstream returned HTTP ${resp.status}`,
-            code: "UPSTREAM_ERROR",
-          },
-        };
-      }
-      // Keep the timer armed through the body read so a slow stream is bounded too.
-      read = await readBodyCapped(resp, FETCH_READ_CAP);
-      break;
-    }
+    // Shared hop-checked fetcher: EVERY hop is SSRF-checked before it is
+    // requested (a public URL that 302s to 169.254.169.254 / an RFC-1918 host
+    // is refused, never fetched), redirects are capped, and ONE deadline
+    // covers every hop plus the capped body read.
+    fetched = await safeFetch(parsed, {
+      headers: { accept: "application/pdf, text/html, text/plain, */*" },
+      timeoutMs: timeouts.extractInvoiceFetch,
+      maxRedirects: MAX_FETCH_REDIRECTS,
+      maxBytes: FETCH_READ_CAP,
+    });
   } catch (err) {
-    const name = (err as { name?: string })?.name;
-    if (name === "AbortError" || name === "TimeoutError") {
+    if (isTimeoutError(err)) {
       return {
         ok: false,
         status: 504,
         body: { error: "Could not fetch url — upstream fetch timed out", code: "UPSTREAM_TIMEOUT" },
       };
     }
-    // checkSsrf throws ValidationError on a private/reserved redirect target;
-    // rethrow so the handler's catch renders the instructive 400 (never leak
-    // it as a generic 502 — the caller should learn the URL was blocked).
+    // The helper's per-hop SSRF check throws ValidationError on a private/
+    // reserved redirect target; rethrow so the handler's catch renders the
+    // instructive 400 (never leak it as a generic 502 — the caller should
+    // learn the URL was blocked).
     if (err instanceof ValidationError) throw err;
+    if (err instanceof FetchProblem) {
+      if (err.code === "TOO_MANY_REDIRECTS") {
+        return {
+          ok: false,
+          status: 502,
+          body: { error: "Could not fetch url — too many redirects", code: "UPSTREAM_ERROR" },
+        };
+      }
+      // Non-http(s) or unparseable Location — the helper's own status/code.
+      return { ok: false, status: err.status, body: { error: err.message, code: err.code } };
+    }
     const message = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
       status: 502,
       body: { error: `Could not fetch url — ${message}`, code: "UPSTREAM_ERROR" },
     };
-  } finally {
-    clearTimeout(timer);
   }
 
-  if (read.exceeded) {
+  if (!fetched.ok) {
+    return {
+      ok: false,
+      status: 502,
+      body: {
+        error: `Could not fetch url — upstream returned HTTP ${fetched.status}`,
+        code: "UPSTREAM_ERROR",
+      },
+    };
+  }
+
+  if (fetched.truncated) {
     return {
       ok: false,
       status: 400,
@@ -418,14 +324,16 @@ async function fetchInvoiceDocument(rawUrl: string): Promise<FetchedDoc> {
     };
   }
 
-  const ct = (resp.headers.get("content-type") || "").toLowerCase();
-  let finalPathname = current.pathname.toLowerCase();
+  const ct = fetched.contentType.toLowerCase();
+  // finalUrl is the last hop's URL (response.url when present, else the
+  // requested hop) — the same precedence the manual loop used.
+  let finalPathname = parsed.pathname.toLowerCase();
   try {
-    if (resp.url) finalPathname = new URL(resp.url).pathname.toLowerCase();
+    finalPathname = new URL(fetched.finalUrl).pathname.toLowerCase();
   } catch {
-    // keep the final-hop pathname
+    // keep the requested pathname
   }
-  const head = read.bytes.subarray(0, 1024).toString("latin1");
+  const head = fetched.bytes.subarray(0, 1024).toString("latin1");
 
   const looksPdf =
     ct.includes("application/pdf") ||
@@ -437,7 +345,7 @@ async function fetchInvoiceDocument(rawUrl: string): Promise<FetchedDoc> {
   if (looksPdf) {
     let parsedPdf: { text?: string };
     try {
-      parsedPdf = await pdfParse(read.bytes);
+      parsedPdf = await pdfParse(fetched.bytes);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return {
@@ -449,10 +357,10 @@ async function fetchInvoiceDocument(rawUrl: string): Promise<FetchedDoc> {
     return { ok: true, text: (parsedPdf.text || "").trim(), contentType: "pdf" };
   }
   if (looksHtml) {
-    return { ok: true, text: htmlToPlainText(read.bytes.toString("utf8")), contentType: "html" };
+    return { ok: true, text: htmlToPlainText(fetched.bytes.toString("utf8")), contentType: "html" };
   }
   if (ct.startsWith("text/") || ct.includes("application/json")) {
-    return { ok: true, text: read.bytes.toString("utf8"), contentType: "text" };
+    return { ok: true, text: fetched.bytes.toString("utf8"), contentType: "text" };
   }
   return {
     ok: false,
@@ -544,20 +452,13 @@ extractInvoiceRouter.post("/extract/invoice", async (req: Request, res: Response
       return;
     }
 
-    // Bound the call(s) with an AbortController so a timeout actually CANCELS the
-    // upstream request, not just the caller's promise.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeouts.extractInvoice);
-
     let fields: InvoiceFields;
     try {
-      // Single-shot: structured outputs (output_config.format) guarantee
-      // schema-valid JSON, so the old retry-once-on-malformed-JSON loop is
-      // dead weight — parse failures can no longer originate from the model.
-      // (API/abort errors were never retried here; the SDK retries 429/5xx.)
-      const attempt: AttemptResult = await attemptExtract(text, controller.signal);
+      // Single-shot: json_object mode + parseLooseJson. (Upstream/transport
+      // errors surface as OpenAiCallError; the helper self-manages timeout.)
+      const attempt: AttemptResult = await attemptExtract(text);
 
-      // Truncation on either attempt is a hard failure — not a billable 200.
+      // Truncation is a hard failure — not a billable 200.
       if (!attempt.ok) {
         res.status(502).json({
           error: "Extraction truncated (response hit max_tokens) — input could not be parsed",
@@ -568,22 +469,17 @@ extractInvoiceRouter.post("/extract/invoice", async (req: Request, res: Response
       fields = attempt.fields;
       // Record token usage for per-call cost/margin logging (read at res.finish).
       res.locals.llmUsage = {
-        model: "claude-haiku-4-5-20251001",
+        model: MODEL,
         inputTokens: attempt.usage.inputTokens,
         outputTokens: attempt.usage.outputTokens,
       };
     } catch (err) {
-      clearTimeout(timer);
-      if (
-        err instanceof Anthropic.APIError ||
-        (err instanceof Error &&
-          (err.name === "AbortError" || err.name === "APIUserAbortError"))
-      ) {
+      if (err instanceof OpenAiCallError) {
         console.error("Extract invoice LLM error:", err);
         res.status(502).json({ error: "Invoice extraction service unavailable" });
         return;
       }
-      // JSON parse failed on both the initial call and the retry.
+      // Model output could not be parsed as JSON.
       console.error("Extract invoice parse error:", err);
       res.status(502).json({
         error: "Invoice extraction failed — model output could not be parsed",
@@ -591,7 +487,6 @@ extractInvoiceRouter.post("/extract/invoice", async (req: Request, res: Response
       });
       return;
     }
-    clearTimeout(timer);
 
     // Nothing extracted at all ⇒ the text wasn't an invoice. Per the
     // /money/parse precedent the product here is the extraction, so "no

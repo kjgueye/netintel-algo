@@ -1,5 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { validateUrl, checkSsrf, ValidationError } from "../utils/validators.js";
+import { safeFetch, FetchProblem } from "../utils/safe-fetch.js";
+import { assessSource } from "../utils/source-usability.js";
 import { timeouts } from "../config.js";
 
 export const pageExtractRouter = Router();
@@ -71,7 +73,10 @@ function stripBySelector(html: string, className: string): string {
 }
 
 function extractContent(html: string): string {
-  let cleaned = html;
+  // Normalize CRLF/CR to LF first — the collapses below match \n only, so
+  // stray \r from CRLF-served pages leaked "\r\n\r\n" runs into content
+  // (2026-07-30 sweep audit).
+  let cleaned = html.replace(/\r\n?/g, "\n");
 
   // Step 1 — Strip noise elements (tag + contents)
   const noiseTags = ["script", "style", "nav", "header", "footer", "aside", "form", "iframe", "noscript"];
@@ -166,44 +171,25 @@ pageExtractRouter.get("/page-extract/read", async (req: Request, res: Response) 
     const maxAttempts = 2;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), timeouts.pageExtract);
-
-        const response = await fetch(parsed.href, {
-          method: "GET",
+        // safeFetch SSRF-checks every redirect hop before requesting it and
+        // keeps one deadline over all hops + the 500 KB body read.
+        const r = await safeFetch(parsed, {
           headers: {
             "User-Agent": "Mozilla/5.0 (compatible; NetIntel/1.0)",
             "Accept": "text/html",
           },
-          redirect: "follow",
-          signal: controller.signal,
+          timeoutMs: timeouts.pageExtract,
+          maxBytes: 500 * 1024,
         });
-
-        clearTimeout(timeout);
-
-        statusCode = response.status;
-        finalUrl = response.url || parsed.href;
-
-        // Read max 500KB
-        const reader = response.body?.getReader();
-        if (reader) {
-          const chunks: Uint8Array[] = [];
-          let totalSize = 0;
-          const maxSize = 500 * 1024;
-
-          while (totalSize < maxSize) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-            totalSize += value.length;
-          }
-          reader.cancel().catch(() => {});
-
-          const decoder = new TextDecoder();
-          html = chunks.map((c) => decoder.decode(c, { stream: true })).join("");
-        }
+        statusCode = r.status;
+        finalUrl = r.finalUrl;
+        html = r.text;
         break;
       } catch (err) {
+        // A refused hop (private host, non-http scheme, too many redirects) is
+        // a verdict, not a transient failure: never retried, never the generic
+        // 500 — the outer catch maps it to its uncharged status.
+        if (err instanceof ValidationError || err instanceof FetchProblem) throw err;
         if (attempt === maxAttempts - 1) {
           const cause = err instanceof Error && "cause" in err ? (err as any).cause : undefined;
           const message = cause?.message || (err instanceof Error ? err.message : String(err));
@@ -224,6 +210,33 @@ pageExtractRouter.get("/page-extract/read", async (req: Request, res: Response) 
     const wordCount = words.length;
     const readingTimeMinutes = wordCount > 0 ? Math.ceil(wordCount / 238) : 0;
     const language = detectLanguage(content);
+
+    // Never bill for a miss: a bot challenge, a 404, or an empty extraction has
+    // nothing to sell, and a graded-down 200 would still settle the payment
+    // (x402 settles on <400). Answer 4xx instead — uncharged.
+    const unusable = assessSource({
+      status: statusCode,
+      title,
+      body: html,
+      contentUnits: wordCount,
+      noun: "content",
+      // Same rule as web-extract: challenge status + <40 extracted words is a
+      // refusal remnant, not the page — uncharged.
+      thinFloor: 40,
+      // JS-rendered / bot-walled pages are /exa/contents' job — point there.
+      suggestRenderer: true,
+    });
+    if (unusable) {
+      res.status(unusable.status).json({
+        error: unusable.error,
+        code: unusable.code,
+        ...(unusable.hint ? { hint: unusable.hint } : {}),
+        url: parsed.href,
+        final_url: finalUrl,
+        status_code: statusCode,
+      });
+      return;
+    }
 
     // Grading
     let score = 100;
@@ -268,6 +281,10 @@ pageExtractRouter.get("/page-extract/read", async (req: Request, res: Response) 
   } catch (err) {
     if (err instanceof ValidationError) {
       res.status(400).json({ error: err.message });
+      return;
+    }
+    if (err instanceof FetchProblem) {
+      res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
     console.error("Page extract error:", err);

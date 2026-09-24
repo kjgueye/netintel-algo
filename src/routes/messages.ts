@@ -3,6 +3,8 @@ import { randomUUID } from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
 import { config, pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
+import { signableAccepts } from "../accepts.js";
+import { estimateTokens, tokenBudgetForCharCap, tokenDensityMessage } from "../utils/token-estimate.js";
 
 // OpenAI-compatible chat endpoint over x402, served by Claude. The request body
 // is OpenAI chat.completions-shaped; we translate to the Anthropic Messages API,
@@ -12,10 +14,18 @@ import { ValidationError } from "../utils/validators.js";
 // pre-agreed amount, so we bound the worst case with hard caps on input size and
 // max_tokens and set the flat price to cover that worst case at a healthy markup:
 //
-//   Sonnet 4.6 buy: $3/MTok in, $15/MTok out. At the caps below the worst-case
-//   upstream cost is ~ (1.5k in × $3 + 1024 out × $15)/1e6 ≈ $0.020. The flat
-//   $0.06 price is ~3× that, so every call clears margin (actual cost ≤ cap).
-//   Adding a model means re-checking that the flat price still covers its rates.
+//   Sonnet 4.6 buy: $3/MTok in, $15/MTok out. At the caps below the *theoretical*
+//   worst case (full 24k-char / ~7.5k-token input + a full 1024-token output) is
+//   ~ (7.5k in × $3 + 1024 out × $15)/1e6 ≈ $0.038, so the flat $0.06 price still
+//   clears ~1.6× at the ceiling. Real calls sit far under it: observed outputs run
+//   ~400 tokens (bounded JSON verdicts), so typical cost is ~$0.01–0.03 and margin
+//   ~2–6×. The 24k input cap (up from 6k) fits agent-swarm callers that send a full
+//   persona + world-state + inbox per turn — their most common bounce was this cap.
+//   The char cap assumes English (~3.2 chars/token); token-dense scripts (CJK ~1
+//   token/char) are additionally bounded by the estimateTokens() budget below, or
+//   24k chars of CJK (~$0.072 input alone) would exceed the flat price.
+//   Adding a model — or raising the input cap further — means re-checking that the
+//   flat price still covers its rates at the new ceiling.
 
 export const messagesRouter = Router();
 
@@ -52,8 +62,8 @@ function resolveModel(input: unknown): MessagesModel | null {
 // --- Caps (bound the cost so the flat price always clears margin) -----------
 const DEFAULT_MAX_TOKENS = 1024;
 const HARD_MAX_TOKENS = 1024;
-// Total characters across all message content + system, ~6 KB (~1.5k tokens).
-const MAX_INPUT_CHARS = 6000;
+// Total characters across all message content + system, ~24 KB (~7.5k tokens).
+const MAX_INPUT_CHARS = 24000;
 
 export function clampMaxTokens(input: unknown): number {
   const n = Number(input);
@@ -121,14 +131,7 @@ export function toAnthropicMessages(rawMessages: any[]): {
 // instead of a 404. (The POST is paywalled by paymentMiddleware.)
 const messagesPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.messages,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.messages),
   error: "Payment required",
 };
 
@@ -173,6 +176,14 @@ messagesRouter.post("/messages", async (req: Request, res: Response) => {
         `Input too large: ${chars} characters across messages (max ${MAX_INPUT_CHARS}). Split the request or summarize first.`,
       );
     }
+    // The char cap alone under-counts token-dense scripts (CJK ~1 token/char):
+    // 24k chars of CJK ≈ 24k input tokens ≈ $0.072 at Sonnet rates — over the
+    // flat price by itself. Enforce the token budget the price was derived for.
+    const inTokenBudget = tokenBudgetForCharCap(MAX_INPUT_CHARS);
+    const estTokens = estimateTokens(body.messages.map((m: any) => contentToText(m?.content)).join(" "));
+    if (estTokens > inTokenBudget) {
+      throw new ValidationError(tokenDensityMessage(estTokens, inTokenBudget));
+    }
 
     // At most one of temperature/top_p (sending both 400s on Claude 4.x), and
     // only for models that accept sampling params at all.
@@ -182,27 +193,36 @@ messagesRouter.post("/messages", async (req: Request, res: Response) => {
       else if (typeof body.top_p === "number") sampling.top_p = body.top_p;
     }
 
+    // Deadline via an AbortController handed to the SDK (same pattern as
+    // money-parse): on timeout the in-flight request is actually cancelled. The
+    // old Promise.race left it running — and its timer armed — after we answered.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeouts.messages);
     let response: Anthropic.Message;
     try {
-      response = await Promise.race([
-        anthropic.messages.create({
+      response = await anthropic.messages.create(
+        {
           model: model.anthropicModel,
           max_tokens: maxTokens,
           ...(system ? { system } : {}),
           messages,
           ...sampling,
-        }),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("timeout")), timeouts.messages),
-        ),
-      ]);
+        },
+        { signal: controller.signal },
+      );
     } catch (err) {
-      if (err instanceof Anthropic.APIError || (err instanceof Error && err.message === "timeout")) {
+      // Our own abort surfaces from the SDK as APIUserAbortError (an APIError).
+      if (
+        err instanceof Anthropic.APIError ||
+        (err instanceof Error && (err.name === "AbortError" || err.name === "APIUserAbortError"))
+      ) {
         console.error("Messages LLM error:", err);
         res.status(502).json({ error: { message: "Upstream model error", type: "upstream_error" } });
         return;
       }
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
 
     // Record token usage for per-call cost/margin logging (read at res.finish).

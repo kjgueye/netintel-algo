@@ -3,6 +3,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { config, pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
 
 export const sentimentRouter = Router();
 
@@ -23,14 +24,7 @@ const EMOTIONS = ["joy", "anger", "sadness", "fear", "surprise", "disgust", "tru
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const sentimentPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.sentiment,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.sentiment),
   error: "Payment required",
 };
 

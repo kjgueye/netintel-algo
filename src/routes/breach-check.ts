@@ -1,4 +1,5 @@
 import { Router, type Request, type Response } from "express";
+import { pickRequestParam } from "../utils/field-aliases.js";
 import crypto from "node:crypto";
 import { timeouts } from "../config.js";
 
@@ -133,9 +134,14 @@ export async function runBreachCheck(password: string): Promise<BreachCheckResul
   };
 }
 
-breachCheckRouter.get("/breach-check/password", async (req: Request, res: Response) => {
+const handleBreachCheck = async (req: Request, res: Response) => {
   try {
-    const password = req.query.password as string | undefined;
+    // Read from the BODY as well as the query. A password in a query string is
+    // written into edge logs, proxies and shell history before we ever hash it
+    // — the k-anonymity prefix protects it from HaveIBeenPwned, not from the
+    // transport. Flagged on solana-foundation/pay-skills#269. The GET form stays
+    // for the callers already paying for it; POST is the documented way.
+    const password = pickRequestParam(req, ["password", "pass", "pwd"]);
 
     if (!password || password.length === 0) {
       res.status(400).json({ error: "password is required" });
@@ -156,4 +162,7 @@ breachCheckRouter.get("/breach-check/password", async (req: Request, res: Respon
     console.error("Breach check error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
-});
+};
+
+breachCheckRouter.get("/breach-check/password", handleBreachCheck);
+breachCheckRouter.post("/breach-check/password", handleBreachCheck);

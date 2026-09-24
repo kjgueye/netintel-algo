@@ -1,19 +1,13 @@
 import { Router, type Request, type Response } from "express";
 import { config, pricing } from "../config.js";
+import { signableAccepts } from "../accepts.js";
 
 export const langDetectRouter = Router();
 
 // GET/HEAD return 402 so Bazaar health prober sees a payment challenge
 const langDetectPaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.langDetect,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.langDetect),
   error: "Payment required",
 };
 
@@ -236,6 +230,38 @@ function scoreLatin(text: string): LangScore[] {
   return scores;
 }
 
+// --- Common-word fallback (short texts) ---
+
+// The stopword profiles above are grammatical function words, which short
+// greetings/fragments often contain none of — the 2026-07-30 catalog sweep
+// sent "hello world" and got Unknown/F. A tiny per-language lexicon of
+// distinctive everyday words catches those. Only consulted when stopword
+// scoring finds nothing, and a cross-language tie stays Unknown.
+const COMMON_WORDS: Array<{ name: string; code: string; words: string[] }> = [
+  { name: "English", code: "en", words: ["hello", "hi", "hey", "thanks", "thank", "please", "welcome", "goodbye", "world", "good", "morning", "yes", "friend", "love"] },
+  { name: "Spanish", code: "es", words: ["hola", "gracias", "adios", "buenos", "buenas", "dias", "noches", "amigo", "mundo", "favor"] },
+  { name: "French", code: "fr", words: ["bonjour", "bonsoir", "merci", "salut", "monde", "amour", "oui", "bienvenue"] },
+  { name: "German", code: "de", words: ["hallo", "danke", "bitte", "guten", "morgen", "welt", "tschuss", "willkommen"] },
+  { name: "Italian", code: "it", words: ["ciao", "grazie", "prego", "buongiorno", "buonasera", "mondo", "amore", "benvenuto"] },
+  { name: "Portuguese", code: "pt", words: ["ola", "obrigado", "obrigada", "bom", "boa", "mundo", "amor", "bemvindo"] },
+  { name: "Dutch", code: "nl", words: ["hoi", "dank", "bedankt", "wereld", "goede", "welkom"] },
+  { name: "Turkish", code: "tr", words: ["merhaba", "tesekkur", "tesekkurler", "dunya", "gunaydin"] },
+  { name: "Indonesian", code: "id", words: ["halo", "terima", "kasih", "selamat", "dunia", "pagi"] },
+];
+
+function scoreCommonWords(words: string[]): LangScore[] {
+  const wordSet = new Set(words);
+  const scores: LangScore[] = [];
+  for (const lex of COMMON_WORDS) {
+    const matches = lex.words.filter((w) => wordSet.has(w)).length;
+    if (matches > 0) {
+      scores.push({ name: lex.name, code: lex.code, score: matches / words.length });
+    }
+  }
+  scores.sort((a, b) => b.score - a.score);
+  return scores;
+}
+
 // --- Grading ---
 
 interface Finding {
@@ -292,9 +318,26 @@ langDetectRouter.post("/lang-detect/analyze", (req: Request, res: Response) => {
       const scores = scoreLatin(text);
 
       if (scores.length === 0 || scores[0].score === 0) {
-        detectedLanguage = "Unknown";
-        languageCode = "";
-        confidence = "low";
+        // Stopwords missed entirely (common for short greetings) — fall back
+        // to the everyday-word lexicon before conceding Unknown.
+        const common = scoreCommonWords(words);
+        const decisive =
+          common.length > 0 &&
+          (common.length === 1 || common[0].score > common[1].score);
+        if (decisive) {
+          detectedLanguage = common[0].name;
+          languageCode = common[0].code;
+          confidence = "low";
+          alternatives = common.slice(1, 4).map((s) => ({
+            language: s.name,
+            code: s.code,
+            score: Math.round(s.score * 100) / 100,
+          }));
+        } else {
+          detectedLanguage = "Unknown";
+          languageCode = "";
+          confidence = "low";
+        }
       } else {
         const top = scores[0];
         const second = scores.length > 1 ? scores[1] : { score: 0 };

@@ -1,9 +1,10 @@
 import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
-import Anthropic from "@anthropic-ai/sdk";
-import { config, pricing, timeouts } from "../config.js";
+import { pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { parseLooseJson } from "../utils/parse-loose-json.js";
+import { signableAccepts } from "../accepts.js";
+import { openaiJsonComplete, OpenAiCallError } from "../services/openai-json.js";
 
 export const extractResumeRouter = Router();
 
@@ -18,6 +19,11 @@ const MAX_BYTES = 50 * 1024;
 // multiple experience + education + skills entries — so give the model the most
 // room to avoid truncating mid-array.
 const MAX_TOKENS = 3072;
+
+// Swapped from Anthropic Haiku to gpt-4o-mini 2026-09-02 (see the pricing
+// deep-dive / src/services/openai-json.ts); the shared helper self-manages the
+// wall-clock timeout and aborts the upstream request.
+const MODEL = "gpt-4o-mini";
 
 const SERVICE_SLUG = "extract-resume";
 
@@ -95,14 +101,7 @@ type ResumeFields = {
 // GET/HEAD return 402 so the Bazaar health prober sees a payment challenge instead of 404
 const extractResumePaymentRequired = {
   x402Version: 2,
-  accepts: [
-    {
-      scheme: "exact",
-      price: pricing.extractResume,
-      network: config.network,
-      payTo: config.payTo,
-    },
-  ],
+  accepts: signableAccepts(pricing.extractResume),
   error: "Payment required",
 };
 
@@ -113,8 +112,6 @@ extractResumeRouter.get("/extract/resume", (_req: Request, res: Response) => {
 extractResumeRouter.head("/extract/resume", (_req: Request, res: Response) => {
   res.status(402).end();
 });
-
-const anthropic = new Anthropic();
 
 function gradeFromScore(score: number): string {
   if (score >= 90) return "A";
@@ -192,30 +189,25 @@ type AttemptResult =
   | { ok: true; fields: ResumeFields; usage: { inputTokens: number; outputTokens: number } }
   | { ok: false; truncated: true };
 
-async function attemptExtract(text: string, signal: AbortSignal): Promise<AttemptResult> {
-  const response = await anthropic.messages.create(
-    {
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
-      messages: [{ role: "user", content: text }],
-    },
-    { signal },
-  );
+async function attemptExtract(text: string): Promise<AttemptResult> {
+  // openaiJsonComplete self-manages a hard wall-clock timeout (aborts the
+  // upstream request) — no caller-supplied AbortSignal needed.
+  const { content, usage, truncated } = await openaiJsonComplete({
+    modelId: MODEL,
+    system: SYSTEM_PROMPT,
+    user: text,
+    maxTokens: MAX_TOKENS,
+    timeoutMs: timeouts.extractResume,
+  });
 
-  // Truncation guard: if the model hit max_tokens the output may be partial/invalid.
+  // Truncation guard: if the model hit the output cap the JSON may be partial/invalid.
   // Treat as a failed extraction (502), never parse/return partial JSON as a 200.
   // Applied on BOTH the initial call and the retry.
-  if (response.stop_reason === "max_tokens") {
+  if (truncated) {
     return { ok: false, truncated: true };
   }
 
-  const textBlock = response.content.find(
-    (block): block is Anthropic.ContentBlock & { type: "text" } => block.type === "text",
-  );
-  if (!textBlock) throw new Error("no text content");
-
-  const parsed = parseLooseJson(textBlock.text);
+  const parsed = parseLooseJson(content);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new Error("not an object");
   }
@@ -232,8 +224,8 @@ async function attemptExtract(text: string, signal: AbortSignal): Promise<Attemp
       education: parseEducation(p.education),
     },
     usage: {
-      inputTokens: response.usage.input_tokens,
-      outputTokens: response.usage.output_tokens,
+      inputTokens: usage.inputTokens,
+      outputTokens: usage.outputTokens,
     },
   };
 }
@@ -265,28 +257,20 @@ extractResumeRouter.post("/extract/resume", async (req: Request, res: Response) 
       return;
     }
 
-    // Bound the call(s) with an AbortController so a timeout actually CANCELS the
-    // upstream request, not just the caller's promise.
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeouts.extractResume);
-
     let fields: ResumeFields;
     try {
       let attempt: AttemptResult;
       try {
-        attempt = await attemptExtract(text, controller.signal);
+        attempt = await attemptExtract(text);
       } catch (parseErr) {
         // Retry-once on malformed JSON. This is a DELIBERATE ENHANCEMENT over
         // schema-parse (which single-shots) — do NOT remove it to "match" that
-        // route. API/abort errors are not retried here; they rethrow below.
-        if (
-          parseErr instanceof Anthropic.APIError ||
-          (parseErr instanceof Error &&
-            (parseErr.name === "AbortError" || parseErr.name === "APIUserAbortError"))
-        ) {
+        // route. Upstream/transport errors (OpenAiCallError) are not retried
+        // here; they rethrow below.
+        if (parseErr instanceof OpenAiCallError) {
           throw parseErr;
         }
-        attempt = await attemptExtract(text, controller.signal);
+        attempt = await attemptExtract(text);
       }
 
       // Truncation on either attempt is a hard failure — not a billable 200.
@@ -300,17 +284,12 @@ extractResumeRouter.post("/extract/resume", async (req: Request, res: Response) 
       fields = attempt.fields;
       // Record token usage for per-call cost/margin logging (read at res.finish).
       res.locals.llmUsage = {
-        model: "claude-haiku-4-5-20251001",
+        model: MODEL,
         inputTokens: attempt.usage.inputTokens,
         outputTokens: attempt.usage.outputTokens,
       };
     } catch (err) {
-      clearTimeout(timer);
-      if (
-        err instanceof Anthropic.APIError ||
-        (err instanceof Error &&
-          (err.name === "AbortError" || err.name === "APIUserAbortError"))
-      ) {
+      if (err instanceof OpenAiCallError) {
         console.error("Extract resume LLM error:", err);
         res.status(502).json({ error: "Resume extraction service unavailable" });
         return;
@@ -323,7 +302,6 @@ extractResumeRouter.post("/extract/resume", async (req: Request, res: Response) 
       });
       return;
     }
-    clearTimeout(timer);
 
     const skills_count = fields.skills.length;
     const experience_count = fields.experience.length;
