@@ -71,7 +71,22 @@ const app = express();
 // Behind Railway's proxy: trust X-Forwarded-Proto so req.protocol is "https"
 // and the discovery artifacts advertise https URLs when PUBLIC_BASE_URL is unset.
 app.set("trust proxy", true);
-app.use(express.json());
+// verify stashes the raw bytes so the paid-call logger can record a body that
+// did NOT parse (Content-Type mismatch) — mirrors NetIntel src/index.ts.
+app.use(
+  express.json({
+    verify: (req, _res, buf) => {
+      try {
+        if (buf && buf.length) {
+          (req as unknown as { rawBodySnippet?: string }).rawBodySnippet =
+            buf.toString("utf8").slice(0, 8192);
+        }
+      } catch {
+        /* observational only — never break body parsing */
+      }
+    },
+  })
+);
 
 // --- Paid-call analytics (passive observer; algo_* tables only) --------------
 // Writes into the shared NetIntel Postgres but only ever into this service's own

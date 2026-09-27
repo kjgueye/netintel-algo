@@ -51,6 +51,9 @@ const FILES = [
   { from: "payment-headers.ts", to: "payment-headers.ts" },
   { from: "head-challenge.ts", to: "head-challenge.ts" },
   { from: "service-metadata.ts", to: "service-metadata.ts" },
+  // Pure helpers the paid-call logger needs for cost + failure-reason capture.
+  { from: "llm-cost.ts", to: "llm-cost.ts" },
+  { from: "error-detail.ts", to: "error-detail.ts" },
 ];
 
 // Modules NetIntel's route table may import, mapped to what this repo provides.

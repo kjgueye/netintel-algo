@@ -28,6 +28,8 @@
 
 import type { Request, Response, NextFunction } from "express";
 import type { PaidCallEvent, PaidCallStore } from "./paid-call-store.js";
+import { computeLlmCost, type LlmUsage } from "./llm-cost.js";
+import { deriveErrorDetail, type ErrorDetail } from "./error-detail.js";
 
 function safeDecodeBase64Json(value: unknown): any | null {
   if (typeof value !== "string" || value.length === 0) return null;
@@ -107,13 +109,16 @@ export function readSettlement(res: Response): SettlementInfo | null {
 }
 
 /**
- * Universal, non-PII derived signals: request/response byte sizes (declared
- * Content-Length; bodies are never read), a coarse outcome bucket, and the Host
- * the request arrived on (canonical algo.netintel.dev vs the railway.app
- * fallback). Failures additionally record WHY when a reason is available: the
- * handler's JSON `error` string (stashed by the res.json wrapper below), the
- * settlement errorReason, or the verify rejection reason from the
- * PAYMENT-REQUIRED header. Must never throw on this fire-and-forget path.
+ * Per-call signals, kept at parity with NetIntel's logger so the Mission Control
+ * Algo tab can show the same drill-down as the Base/Solana Overview:
+ *  - request/response byte sizes, a coarse outcome bucket, the Host;
+ *  - LLM usage (model, tokens, cost_usdc) from res.locals.llmUsage;
+ *  - failure reason: code/source/field from the res.json wrapper's errorDetail,
+ *    else the settlement errorReason, else the PAYMENT-REQUIRED verify reason;
+ *  - the request (content-type, query, redacted body, unparsed raw bytes) and
+ *    the response body, redacted + size-capped — on success AND failure rows.
+ * The payment-payload diagnostics of the EVM original are deliberately absent:
+ * the AVM payload is opaque msgpack. Must never throw on this fire-and-forget path.
  */
 export function buildMeta(req: Request, res: Response): Record<string, unknown> {
   const status = res.statusCode;
@@ -132,12 +137,41 @@ export function buildMeta(req: Request, res: Response): Record<string, unknown> 
     host: req.headers?.host,
   };
 
+  // LLM usage — ONE usage or an ARRAY (e.g. ai-image's render + metadata call).
+  // The first entry's model/tokens are recorded; cost_usdc is the SUM, and any
+  // unpriced entry keeps it absent (a partial cost would read as complete).
+  try {
+    const rawUsage = (res as { locals?: { llmUsage?: LlmUsage | LlmUsage[] } }).locals?.llmUsage;
+    const usages = Array.isArray(rawUsage) ? rawUsage : rawUsage ? [rawUsage] : [];
+    const primary = usages[0];
+    if (primary && typeof primary.model === "string") {
+      meta.model = primary.model;
+      meta.input_tokens = primary.inputTokens;
+      meta.output_tokens = primary.outputTokens;
+      const costs = usages.map((u) => computeLlmCost(u));
+      if (costs.every((c): c is string => c !== undefined)) {
+        meta.cost_usdc = costs.reduce((sum, c) => sum + Number(c), 0).toFixed(6);
+      }
+    }
+  } catch {
+    /* swallow: usage capture must never affect logging */
+  }
+
   try {
     if (status >= 400) {
+      // Structured failure detail (stashed by the res.json wrapper); a failure
+      // that bypassed res.json still gets a groupable code/source from status.
+      let detail = (res as { locals?: { errorDetail?: ErrorDetail } }).locals?.errorDetail;
+      if (!detail) detail = deriveErrorDetail(status, undefined);
+      meta.error_code = detail.code;
+      if (detail.field !== undefined) meta.failed_field = detail.field;
+      meta.error_source = detail.source;
       // Handler-produced error body (stashed by the res.json wrapper).
       const bodyError = (res as { locals?: { errorMessage?: unknown } }).locals?.errorMessage;
       if (typeof bodyError === "string" && bodyError.length > 0) {
         meta.error_message = bodyError.slice(0, 200);
+      } else if (typeof detail.message === "string" && detail.message.length > 0) {
+        meta.error_message = detail.message.slice(0, 200);
       }
       // Settlement failure reason from the PAYMENT-RESPONSE header.
       if (meta.error_message === undefined) {
@@ -157,7 +191,86 @@ export function buildMeta(req: Request, res: Response): Record<string, unknown> 
   } catch {
     /* swallow: meta enrichment must never affect logging */
   }
+
+  // Request + response payload capture (ALL rows). Stores real customer input
+  // by design (quality audits read it); secret-looking keys are redacted at
+  // every depth and every field is size-capped.
+  try {
+    const ct = req.header("content-type");
+    if (ct) meta.req_content_type = ct;
+
+    const query = captureObject(req.query, 1000);
+    if (query !== undefined) meta.req_query = query;
+
+    const body = (req as { body?: unknown }).body;
+    const bodyKeys = body && typeof body === "object" ? Object.keys(body as object) : [];
+    if (bodyKeys.length) meta.req_body_keys = bodyKeys.slice(0, 40);
+    const capturedBody = captureObject(body, BODY_CAP);
+    if (capturedBody !== undefined) meta.req_body = capturedBody;
+
+    // Raw bytes that did NOT parse into req.body (Content-Type mismatch).
+    const raw = (req as { rawBodySnippet?: string }).rawBodySnippet;
+    if (typeof raw === "string" && raw.length > 0 && bodyKeys.length === 0) {
+      meta.req_raw_unparsed = truncate(raw, BODY_CAP);
+    }
+
+    const respBody = (res as { locals?: { responseBody?: unknown } }).locals?.responseBody;
+    if (typeof respBody === "string") {
+      if (respBody.length) meta.res_body = truncate(respBody, BODY_CAP);
+    } else {
+      const capturedResp = captureObject(respBody, BODY_CAP);
+      if (capturedResp !== undefined) meta.res_body = capturedResp;
+    }
+  } catch {
+    /* swallow: payload capture must never affect logging */
+  }
   return meta;
+}
+
+// --- Payload redaction (verbatim from NetIntel src/paid-call-logger.ts) -------
+
+// Max captured size for request/response bodies; query strings stay at 1 KB.
+const BODY_CAP = 8000;
+
+// Keys whose values are redacted wherever they appear in captured query/body.
+const SENSITIVE_KEY_RE =
+  /pass|secret|token|api[-_]?key|authorization|auth|private|mnemonic|seed|credential/i;
+// …EXCEPT keys that only LOOK sensitive: boolean verdicts (is_private), token
+// COUNTS (max_tokens — plural "tokens" is never a credential) and author(s).
+const SAFE_KEY_RE = /^(?:is|has|was)_|^authors?$|(?:^|_)tokens(?:_|$)/i;
+
+function truncate(s: string, maxLen: number): string {
+  return s.length > maxLen ? `${s.slice(0, maxLen)}…[truncated]` : s;
+}
+
+/** True for a key whose VALUE must never be stored. */
+export function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEY_RE.test(key) && !SAFE_KEY_RE.test(key);
+}
+
+const REDACT_MAX_DEPTH = 16;
+
+/** Redact secret-looking keys at EVERY depth — objects and arrays alike. */
+export function redactDeep(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= REDACT_MAX_DEPTH) return value;
+  if (Array.isArray(value)) return value.map((v) => redactDeep(v, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = isSensitiveKey(k) ? "[redacted]" : redactDeep(v, depth + 1);
+  }
+  return out;
+}
+
+/** Redact then JSON-stringify with a cap; undefined for empty/non-objects. */
+function captureObject(obj: unknown, maxLen: number): string | undefined {
+  if (!obj || typeof obj !== "object") return undefined;
+  if (Object.keys(obj as object).length === 0) return undefined;
+  try {
+    return truncate(JSON.stringify(redactDeep(obj)), maxLen);
+  } catch {
+    return undefined; // non-serializable (circular, etc.)
+  }
 }
 
 /**
@@ -258,16 +371,22 @@ export function createPaidCallLogger(opts: PaidCallLoggerOptions) {
   ): void {
     const start = now();
 
-    // Minimal failure-reason capture: every handler produces errors via
-    // res.status(...).json({ error }). Wrap res.json once to stash the error
-    // string for buildMeta. Best-effort — the caller's response is sacred and
-    // is always sent unchanged.
+    // Wrap res.json once to stash the response body (payload capture) and, on
+    // >= 400, the error string + derived detail for buildMeta. Best-effort — the
+    // caller's response is sacred and is always sent unchanged.
     const originalJson = res.json.bind(res);
     res.json = function (body?: unknown) {
       try {
+        (res.locals as Record<string, unknown>).responseBody = body;
         const err = (body as { error?: unknown } | null | undefined)?.error;
         if (res.statusCode >= 400 && typeof err === "string") {
           (res.locals as Record<string, unknown>).errorMessage = err;
+        }
+        if (res.statusCode >= 400) {
+          (res.locals as Record<string, unknown>).errorDetail = deriveErrorDetail(
+            res.statusCode,
+            body
+          );
         }
       } catch {
         /* swallow: capture must never affect the response */
