@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { paymentHeaderValue } from "../payment-headers.js";
-import { pricing } from "../config.js";
+import { config, pricing } from "../config.js";
+import { resolveBaseUrl } from "../base-url.js";
 import { paidAccepts, signableAccepts } from "../accepts.js";
 import { makeOpenAiHandler, type OpenAiRouterConfig } from "../services/openai-passthrough.js";
 import { withoutVision } from "../services/openai-vision.js";
@@ -167,6 +168,29 @@ const serveModels = (_req: Request, res: Response) => {
 };
 v1OpenAiCompatRouter.get("/v1/models", serveModels);
 v1OpenAiCompatRouter.get("/api/v1/models", serveModels);
+// Clients configured with the bare host as base URL ask for /models (Oct-2026
+// miss log: `node` clients, 3 hits, plus a gateway fingerprinter). One list;
+// same-origin 308 so there is still exactly one models document.
+v1OpenAiCompatRouter.get("/models", (_req, res) => res.redirect(308, "/v1/models"));
+
+// GET /v1 — the x402 probe family (x402probe/1.0, /2.0, x402-probe/1.0) and
+// humans checking "is this an OpenAI-style base URL" land here. A small index
+// of the compatible surface instead of a 404.
+v1OpenAiCompatRouter.get(["/v1", "/api/v1"], (req, res) => {
+  const base = resolveBaseUrl(config.publicBaseUrl, req.protocol, req.get("host"));
+  res.json({
+    openai_compatible: true,
+    base_url: `${base}/v1`,
+    endpoints: {
+      models: `${base}/v1/models`,
+      chat_completions: `${base}/v1/chat/completions`,
+      embeddings: `${base}/v1/embeddings`,
+    },
+    auth: "none — each paid request is settled per call via x402 (HTTP 402 → pay in USDC on Base or Solana → retry). No API key.",
+    pricing: `${base}/pricing`,
+    docs: `${base}/llms.txt`,
+  });
+});
 
 // GET on the paid path → 402 challenge so directory probers see payment
 // requirements instead of a 404 (same pattern as the other paid POST routes).

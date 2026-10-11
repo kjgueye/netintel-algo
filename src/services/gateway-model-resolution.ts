@@ -44,11 +44,21 @@ export function normalizeModelId(raw: string): string {
   return raw.replace(/-\d{4}-\d{2}-\d{2}$/, "");
 }
 
+/**
+ * Placeholder model names clients send when they treat an OpenAI-compatible
+ * gateway as a black box. 1,154 requests from 12 IPs were refused as
+ * "model_unknown" for these in Sep-2026 — each one a caller that never reached
+ * the paywall. They resolve to the cheapest general model; the 402 still quotes
+ * that model's own price, so nothing is charged that wasn't quoted.
+ */
+export const GATEWAY_MODEL_ALIASES: Record<string, string> = { default: "gpt-4o-mini", auto: "gpt-4o-mini", test: "gpt-4o-mini" };
+
 function computeResolution(body: unknown): GatewayResolution {
   const raw = (body as { model?: unknown } | null | undefined)?.model;
   if (raw === undefined || raw === null || raw === "") return { kind: "missing" };
   if (typeof raw !== "string") return { kind: "invalid_type", got: Array.isArray(raw) ? "an array" : typeof raw };
-  const model = openAiModelById(normalizeModelId(raw));
+  const aliased = GATEWAY_MODEL_ALIASES[raw.trim().toLowerCase()];
+  const model = openAiModelById(normalizeModelId(aliased ?? raw));
   return model ? { kind: "ok", requested: raw, model } : { kind: "unknown", requested: raw };
 }
 

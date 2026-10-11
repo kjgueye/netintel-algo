@@ -70,6 +70,7 @@ const TAG_OVERRIDES: Record<string, string[]> = {
   "/market/snapshot": ["market data", "market briefing", "fear and greed", "crypto snapshot", "no api key"],
   "/web/fetch": ["fetch url", "retrieve url content", "web content", "json api", "http get"],
   "/web/extract": ["web content", "retrieve url content", "read webpage", "html to markdown", "web reader"],
+  "/pdf/parse": ["pdf to text", "pdf parser", "pdf to markdown", "extract text from pdf", "document parsing"],
   "/page-extract/read": ["read webpage", "web content", "url to markdown", "page reader", "article extract"],
   "/weather/current": ["weather", "forecast", "current weather", "temperature", "climate"],
   "/weather/forecast": ["weather forecast", "forecast", "7 day forecast", "hourly weather", "precipitation"],
@@ -81,6 +82,19 @@ const TAG_OVERRIDES: Record<string, string[]> = {
   "/exa/contents": ["exa contents", "page text", "url to text", "web content", "read webpage"],
   "/exa/answer": ["exa answer", "web answer", "question answering", "grounded answer", "cited answer"],
   "/email/verify": ["email verification", "verify email", "email deliverability", "email validation", "mx check"],
+  // Mercator (Tempo's tool router, mercator.sh) turns these tags into the record's
+  // aliases/capabilities and keys alias_match/capability_match on EXACT phrases —
+  // the 2026-10-07 probe lost "email deliverability check" to a competitor whose
+  // tag was that phrase, and found /tech-fingerprint absent for "what technologies
+  // does a website use". Each set below names the task in the agent's words. CDP
+  // gives tags zero weight, so this costs nothing there.
+  "/email-auth": ["email deliverability check", "spf dkim dmarc", "domain email security", "dmarc check", "email spoofing check"],
+  "/security-headers/analyze": ["security headers check", "http security headers", "csp", "hsts", "website security audit"],
+  "/tech-fingerprint/analyze": ["website technologies", "tech stack lookup", "technology detection", "detect website tech stack", "cms detection"],
+  "/ip-reputation/analyze": ["ip reputation", "ip reputation check", "ip blacklist check", "abuse score", "malicious ip check"],
+  "/ip-geo/locate": ["ip geolocation", "ip location lookup", "geolocate ip address", "ip to country city", "ip lookup"],
+  "/translate/short": ["translate text", "text translation", "translation api", "language translation", "localization"],
+  "/asn-lookup/analyze": ["asn lookup", "asn lookup for ip", "bgp prefixes", "autonomous system", "ip to asn"],
   // Task-vocabulary tags. The 2026-09-09 discovery audit found /dns/lookup absent
   // from CDP search for task-shaped DNS phrasings ("resolve a hostname to its
   // addresses", "mail and text records") while ranking #7 for the endpoint-shaped

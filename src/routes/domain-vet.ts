@@ -572,10 +572,17 @@ domainVetRouter.post("/domain/vet", async (req: Request, res: Response) => {
     await Promise.all(
       deepTargets.map(async (t) => {
         const domain = t.preferredDomain;
+        // The look-alike scan is TLD-bound to the domain it is given. When the
+        // pick is not a .com, squatters and resellers still live in .com — so
+        // scan the .com twin's neighbourhood too and merge. Before 2026-10-11 a
+        // satsdesk.io pick reported "0 registered look-alikes" while satsdesk.com
+        // sat parked for sale and watsdesk.com (one key off) was registered.
+        const comTwin = domain.endsWith(".com") ? null : `${t.c.name}.com`;
 
-        const [appraiseRes, typoRes] = await Promise.allSettled([
+        const [appraiseRes, typoRes, comTypoRes] = await Promise.allSettled([
           withTimeout(Promise.resolve().then(() => runDomainAppraise(domain)), remaining()),
           withTimeout(runTyposquat(domain), remaining()),
+          comTwin ? withTimeout(runTyposquat(comTwin), remaining()) : Promise.resolve(null),
         ]);
 
         let appraisal: unknown = null;
@@ -606,12 +613,23 @@ domainVetRouter.post("/domain/vet", async (req: Request, res: Response) => {
         let lookalikes: string[] | null = null;
         if (typoRes.status === "fulfilled") {
           const t2 = typoRes.value;
-          lookalikes = t2.registered_lookalikes.map((v) => v.domain);
-          const ratio = t2.variations_checked > 0 ? t2.registered_count / t2.variations_checked : 0;
+          // Merge the .com twin's scan when it ran: registered look-alikes are
+          // unioned by domain (the pick's own scan already covers the twin
+          // itself via its alternate-TLD variant), checks are summed. A failed
+          // twin scan degrades honestly instead of silently narrowing the view.
+          const twin = comTwin && comTypoRes.status === "fulfilled" ? comTypoRes.value : null;
+          if (comTwin && !twin) signalsUnavailable.add("typosquat-com");
+          const registered = new Map<string, string>();
+          for (const v of t2.registered_lookalikes) registered.set(v.domain, v.domain);
+          for (const v of twin?.registered_lookalikes ?? []) registered.set(v.domain, v.domain);
+          lookalikes = [...registered.keys()];
+          const checked = t2.variations_checked + (twin?.variations_checked ?? 0);
+          const ratio = checked > 0 ? registered.size / checked : 0;
           typosquat = {
-            registered_lookalikes: t2.registered_count,
-            available_defensive: t2.available_count,
+            registered_lookalikes: registered.size,
+            available_defensive: checked - registered.size,
             risk: ratio > 0.33 ? "high" : ratio >= 0.15 ? "medium" : "low",
+            scanned: twin ? [domain, comTwin] : [domain],
             source: "typosquat",
           };
         } else {

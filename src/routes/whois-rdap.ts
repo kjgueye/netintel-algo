@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from "express";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
+import { rdapServerForTld as sharedRdapServerForTld } from "../utils/rdap-servers.js";
 
 export const whoisRdapRouter = Router();
 
@@ -94,33 +95,11 @@ function daysBetween(from: Date, to: Date): number {
   return Math.floor((to.getTime() - from.getTime()) / (1000 * 60 * 60 * 24));
 }
 
-// ccTLD registries that RUN public RDAP servers but are absent from IANA's
-// bootstrap file (ccTLDs aren't required to register there). Each entry was
-// verified live to serve /domain/<name> with valid RDAP JSON. Production data:
-// paid .io lookups 404'd "No RDAP server found" — a supported-looking TLD we
-// could actually serve. Identity Digital runs the backend for all four.
-const SUPPLEMENTAL_RDAP: Record<string, string> = {
-  io: "https://rdap.identitydigital.services/rdap",
-  me: "https://rdap.identitydigital.services/rdap",
-  sh: "https://rdap.identitydigital.services/rdap",
-  ac: "https://rdap.identitydigital.services/rdap",
-};
-
-/** RDAP base URL for a TLD: the IANA bootstrap first, then the supplemental map. */
-function rdapServerForTld(
-  bootstrapData: { services: string[][][] },
-  tld: string
-): string | null {
-  if (Array.isArray(bootstrapData.services)) {
-    for (const service of bootstrapData.services) {
-      const tlds = service[0];
-      const urls = service[1];
-      if (Array.isArray(tlds) && tlds.includes(tld) && Array.isArray(urls) && urls.length > 0) {
-        return urls[0].replace(/\/+$/, "");
-      }
-    }
-  }
-  return SUPPLEMENTAL_RDAP[tld] ?? null;
+// RDAP base URL for a TLD: the IANA bootstrap first, then the supplemental
+// ccTLD map — both now live in utils/rdap-servers.ts so every RDAP consumer
+// (bulk-domain, domain-availability, domain-age, domain-report) agrees.
+function rdapServerForTld(bootstrapData: { services: string[][][] }, tld: string): string | null {
+  return sharedRdapServerForTld(bootstrapData, tld);
 }
 
 // --- Extracted RDAP logic (shared with the domain-report-full aggregator) ---

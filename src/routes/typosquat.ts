@@ -48,8 +48,12 @@ const HOMOGLYPHS: Array<[string, string]> = [
   ["o", "0"], ["l", "1"], ["i", "1"], ["e", "3"], ["a", "@"],
 ];
 
-// Alternate TLDs to swap the original name onto
-const ALT_TLDS = ["net", "org", "io", "co", "app"];
+// Alternate TLDs to swap the original name onto. "com" leads: for any brand
+// picked on another TLD, the registered .com twin is the look-alike that
+// matters most, and until 2026-10-11 it was never checked (the list lacked it),
+// so a .io pick reported "0 registered look-alikes" while its .com sat parked
+// for sale. The input's own TLD is filtered out at use.
+const ALT_TLDS = ["com", "net", "org", "io", "co", "app"];
 
 // Cap on adjacent-key variants to keep counts under control
 const ADJACENT_KEY_CAP = 10;

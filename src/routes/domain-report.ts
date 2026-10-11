@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import net from "node:net";
 import tls from "node:tls";
 import { timeouts } from "../config.js";
+import { rdapServerForTld } from "../utils/rdap-servers.js";
 import { checkSsrf, validateDomain, ValidationError } from "../utils/validators.js";
 import { isDnsblListing, queryDns, resolveTxt } from "../utils/dns-resolvers.js";
 import { safeFetch } from "../utils/safe-fetch.js";
@@ -158,17 +159,8 @@ async function whoisCheck(domain: string): Promise<WhoisSection> {
     if (!bootstrapRes.ok) return WHOIS_EMPTY;
     const bootstrap = (await bootstrapRes.json()) as { services: string[][][] };
 
-    let rdapBaseUrl: string | null = null;
-    if (Array.isArray(bootstrap.services)) {
-      for (const service of bootstrap.services) {
-        const tlds = service[0];
-        const urls = service[1];
-        if (Array.isArray(tlds) && tlds.includes(tld) && Array.isArray(urls) && urls.length > 0) {
-          rdapBaseUrl = urls[0].replace(/\/+$/, "");
-          break;
-        }
-      }
-    }
+    // IANA bootstrap first, then the supplemental ccTLD map (utils/rdap-servers.ts).
+    const rdapBaseUrl = rdapServerForTld(bootstrap, tld);
     if (!rdapBaseUrl) return WHOIS_EMPTY;
 
     await checkSsrf(new URL(rdapBaseUrl).hostname);

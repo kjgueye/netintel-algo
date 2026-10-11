@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { nsPresence } from "../utils/dns-resolvers.js";
 import { checkSsrf, ValidationError } from "../utils/validators.js";
 import { timeouts, pricing } from "../config.js";
+import { rdapServerForTld } from "../utils/rdap-servers.js";
 import { signableAccepts } from "../accepts.js";
 
 export const bulkDomainRouter = Router();
@@ -96,16 +97,11 @@ async function getBootstrap(): Promise<Bootstrap> {
   return (await res.json()) as Bootstrap;
 }
 
+// IANA bootstrap first, then the supplemental ccTLD map (.io et al. — see
+// utils/rdap-servers.ts). Before this, .io fell through to the DNS fallback
+// and came back "registered, registrar: null".
 function findRdapServer(bootstrap: Bootstrap, tld: string): string | null {
-  if (!Array.isArray(bootstrap.services)) return null;
-  for (const service of bootstrap.services) {
-    const tlds = service[0];
-    const urls = service[1];
-    if (Array.isArray(tlds) && tlds.includes(tld) && Array.isArray(urls) && urls.length > 0) {
-      return urls[0].replace(/\/+$/, "");
-    }
-  }
-  return null;
+  return rdapServerForTld(bootstrap, tld);
 }
 
 async function checkSingleDomain(combo: Combination, bootstrap: Bootstrap): Promise<DomainResult> {

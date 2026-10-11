@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import { nsPresence } from "../utils/dns-resolvers.js";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
+import { rdapServerForTld } from "../utils/rdap-servers.js";
 
 export const domainAvailabilityRouter = Router();
 
@@ -78,16 +79,9 @@ async function getBootstrap(): Promise<{ services: string[][][] }> {
   return (await res.json()) as { services: string[][][] };
 }
 
+// IANA bootstrap first, then the supplemental ccTLD map (utils/rdap-servers.ts).
 function findRdapServer(bootstrap: { services: string[][][] }, tld: string): string | null {
-  if (!Array.isArray(bootstrap.services)) return null;
-  for (const service of bootstrap.services) {
-    const tlds = service[0];
-    const urls = service[1];
-    if (Array.isArray(tlds) && tlds.includes(tld) && Array.isArray(urls) && urls.length > 0) {
-      return urls[0].replace(/\/+$/, "");
-    }
-  }
-  return null;
+  return rdapServerForTld(bootstrap, tld);
 }
 
 async function checkSingleDomain(fullDomain: string, bootstrap: { services: string[][][] }): Promise<DomainResult> {

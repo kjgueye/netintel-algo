@@ -266,6 +266,10 @@ export const pricing = {
   webExtract: "$0.003",
   // Raw fetch sibling of /web/extract (same price, keyless ⇒ pure margin).
   webFetch: "$0.003",
+  // PDF → Markdown, text layer only (in-process pdf.js, zero COGS; no OCR).
+  // $0.005 = the category leader's price (2026-10-10 Bazaar pull); owner-confirmed
+  // 2026-10-10 (the Wedge A proposal's $0.01 assumed OCR, at $0.004/page upstream).
+  pdfParse: "$0.005",
   // Exa neural web search resale (GET|POST /exa/search + alias /web/search).
   // Flat $0.01 vs Exa's list price (checked 2026-09-05): $0.007/request for
   // up to 10 results, +$0.001 per result above 10, +$0.001/page when snippets
@@ -701,6 +705,8 @@ export const timeouts = {
   webExtract: 12000,
   // Data APIs (ArcGIS, open-data portals) are slow — the whole point vs extract's 12s.
   webFetch: 25000,
+  // /pdf/parse URL mode: one deadline over every hop + the (≤10 MB) body read.
+  pdfParseFetch: 20000,
   // One POST to Exa's /search for GET|POST /exa/search (+ /web/search alias).
   exaSearch: 20000,
   // One POST to Exa's /contents for GET|POST /exa/contents. Longer than

@@ -331,10 +331,14 @@ subnetRouter.get("/subnet/calc", (req: Request, res: Response) => {
 
     // Decode BEFORE splitting so a double-encoded list (`%2C` commas, `%2F`
     // slashes — seen live in paid_call_failures) still splits into its CIDRs.
+    // A bare address is a host route: 145 free-tier calls from 9 clients in the
+    // first days of the free tier sent `cidr=8.8.8.8` and got a 400. /32 (/128
+    // for IPv6) is what every subnet calculator assumes for a bare IP.
     const parts = decodeLeftoverPercentEncoding(rawCidr)
       .split(",")
       .map((c) => c.trim())
-      .filter(Boolean);
+      .filter(Boolean)
+      .map((c) => (c.includes("/") ? c : c.includes(":") ? `${c}/128` : /^\d{1,3}(\.\d{1,3}){3}$/.test(c) ? `${c}/32` : c));
 
     // Validate all CIDRs
     const validated = parts.map((p) => validateCidr(p));

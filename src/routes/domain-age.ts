@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from "express";
 import net from "node:net";
 import { validateDomain, checkSsrf, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
+import { rdapServerForTld } from "../utils/rdap-servers.js";
 
 export const domainAgeRouter = Router();
 
@@ -66,17 +67,8 @@ async function fetchRdapCreation(domain: string, timeout: number): Promise<RdapR
   const bootstrapData = (await bootstrapRes.json()) as { services?: string[][][] };
 
   const tld = domain.slice(domain.lastIndexOf(".") + 1);
-  let rdapBaseUrl: string | null = null;
-  if (Array.isArray(bootstrapData.services)) {
-    for (const service of bootstrapData.services) {
-      const tlds = service[0];
-      const urls = service[1];
-      if (Array.isArray(tlds) && tlds.includes(tld) && Array.isArray(urls) && urls.length > 0) {
-        rdapBaseUrl = urls[0].replace(/\/+$/, "");
-        break;
-      }
-    }
-  }
+  // IANA bootstrap first, then the supplemental ccTLD map (utils/rdap-servers.ts).
+  const rdapBaseUrl = rdapServerForTld(bootstrapData, tld);
   if (!rdapBaseUrl) return { supported: false, date: null };
 
   const rdapHostname = new URL(rdapBaseUrl).hostname;

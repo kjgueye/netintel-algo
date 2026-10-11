@@ -44,8 +44,13 @@ export class FetchProblem extends Error {
 }
 
 export interface SafeFetchOptions {
-  method?: "GET" | "HEAD";
+  /** POST exists for the router's unpaid 402 probes of catalog URLs; callers
+   *  fetching caller-supplied URLs stay on GET/HEAD. */
+  method?: "GET" | "HEAD" | "POST";
   headers?: Record<string, string>;
+  /** Request body (POST only). Redirects follow fetch's rules: 307/308 resend
+   *  it; 301/302/303 switch to GET and drop it. */
+  body?: string;
   /** Hard wall-clock cap covering every hop AND the body read. */
   timeoutMs: number;
   /** Max redirect hops to follow (default 5). */
@@ -135,7 +140,8 @@ function isRedirect(status: number): boolean {
  *   - whatever fetch() throws on transport failure.
  */
 export async function safeFetch(start: string | URL, opts: SafeFetchOptions): Promise<SafeFetchResult> {
-  const method = opts.method ?? "GET";
+  let method = opts.method ?? "GET";
+  let body = method === "POST" ? opts.body : undefined;
   const maxRedirects = opts.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const controller = new AbortController();
@@ -149,6 +155,7 @@ export async function safeFetch(start: string | URL, opts: SafeFetchOptions): Pr
       const resp = await fetch(current.href, {
         method,
         headers: opts.headers,
+        body,
         redirect: "manual",
         signal: controller.signal,
       });
@@ -187,6 +194,11 @@ export async function safeFetch(start: string | URL, opts: SafeFetchOptions): Pr
         // Never forward embedded credentials to the next hop.
         next.username = "";
         next.password = "";
+        // fetch's redirect rules: only 307/308 replay a POST body.
+        if (method === "POST" && status !== 307 && status !== 308) {
+          method = "GET";
+          body = undefined;
+        }
         current = next;
         continue;
       }

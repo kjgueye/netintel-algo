@@ -48,6 +48,7 @@ import { entityExtractRouter } from "./routes/entity-extract.js";
 import { extractAddressRouter } from "./routes/extract-address.js";
 import { extractContactRouter } from "./routes/extract-contact.js";
 import { extractInvoiceRouter } from "./routes/extract-invoice.js";
+import { pdfParseRouter } from "./routes/pdf-parse.js";
 import { extractResumeRouter } from "./routes/extract-resume.js";
 import { extractTableRouter } from "./routes/extract-table.js";
 import { markdownCleanRouter } from "./routes/markdown-clean.js";
@@ -1711,7 +1712,17 @@ const routes = {
   "GET /dns/lookup": {
     accepts: paidAccepts(pricing.dnsLookup),
     description:
-      "DNS lookup for any domain — resolve A, AAAA, MX, TXT, NS, CNAME, SOA and PTR records in one call. Parses SPF/DMARC from TXT plus DKIM at the default._domainkey selector, and cross-checks A records across Google/Cloudflare/Quad9 resolvers for propagation consistency. Also answers nslookup / dig style queries.",
+      // Deliberately ONE line. CDP's ranker scores a short single-topic
+      // description above a paragraph for a two-word query ("dns lookup"): with
+      // the paragraph we sat #11 behind ten one-liners that had fewer payers
+      // (2026-09-25 probe). The DKIM selector, resolver cross-check and
+      // nslookup/dig detail stay visible in the output example and llms-full.
+      // Experiment 2026-09-25: cutting the paragraph to one line moved "dns
+      // lookup" only #11→#10, and dropping the verb "resolve" cost "resolve dns
+      // records for a domain" #6→#11 — the ranker keys on the exact words agents
+      // type, so the first clause keeps every one of them: lookup, resolve,
+      // records, domain. Short, but verbatim.
+      "DNS lookup for any domain — resolve A, AAAA, MX, TXT, NS, CNAME, SOA and PTR records in one call, with SPF and DMARC parsed from TXT.",
     mimeType: "application/json",
     extensions: {
       ...declareDiscoveryExtension({
@@ -4058,6 +4069,64 @@ const routes = {
             grade: "A",
             findings: [],
             source: { type: "text", url: null, content_type: null },
+          },
+        },
+      }),
+    },
+  },
+  "POST /pdf/parse": {
+    accepts: paidAccepts(pricing.pdfParse),
+    description:
+      "Parse a PDF to text and Markdown: send a PDF url or base64 file, get clean Markdown with paragraphs rebuilt from the text layer, per-page character offsets for citing pages, metadata (title, author, dates, page count) and the page numbers that are scanned images with no text layer. Up to 50 pages per call. Text layer only, no OCR: an image-only PDF returns an uncharged 422.",
+    mimeType: "application/json",
+    extensions: {
+      ...declareDiscoveryExtension({
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: { type: "string", description: "Public URL of the PDF (up to 10 MB)" },
+            file_base64: { type: "string", description: "The PDF as base64 or a data: URL (up to ~700 KB). Send url OR file_base64." },
+            pages: { type: "string", description: "Pages to parse, 1-based, e.g. \"1-3,7\" (default: the first 50)" },
+            max_chars: { type: "number", description: "Cap on the markdown length (default 100000)" },
+          },
+        },
+        input: { url: "https://netintel.dev/samples/pdf-parse-sample.pdf" },
+        bodyType: "json",
+        output: {
+          schema: {
+            type: "object",
+            properties: {
+              source: { type: "object" },
+              page_count: { type: "number" },
+              pages_parsed: { type: "number" },
+              metadata: { type: "object" },
+              markdown: { type: "string", description: "All parsed pages, each after a <!-- page N --> marker" },
+              pages: { type: "array", description: "Per page: page, word_count, has_text, char_start, char_end (offsets into markdown)" },
+              word_count: { type: "number" },
+              char_count: { type: "number" },
+              scanned_pages: { type: "array", items: { type: "number" } },
+              truncated: { type: "boolean" },
+              findings: { type: "array", items: { type: "string" } },
+            },
+          },
+          // Live output for the input above (markdown and metadata trimmed to keep
+          // the paymentPayload small — see memory x402-paymentpayload-size-limit).
+          example: {
+            source: { type: "url", url: "https://netintel.dev/samples/pdf-parse-sample.pdf", final_url: "https://netintel.dev/samples/pdf-parse-sample.pdf", bytes: 2236 },
+            page_count: 3,
+            pages_parsed: 3,
+            metadata: { title: "Quarterly Network Report (sample)", author: "NetIntel", created: "2026-10-10T00:00:00Z", pdf_version: "1.4", has_form: false },
+            markdown: "<!-- page 1 -->\n\n## Quarterly Network Report\n\nThis sample shows what POST /pdf/parse returns: paragraphs rebuilt from the text layer, ...",
+            pages: [
+              { page: 1, word_count: 76, has_text: true, char_start: 0, char_end: 507 },
+              { page: 2, word_count: 0, has_text: false, char_start: 509, char_end: 581 },
+              { page: 3, word_count: 19, has_text: true, char_start: 583, char_end: 730 },
+            ],
+            word_count: 95,
+            char_count: 730,
+            scanned_pages: [2],
+            truncated: false,
+            findings: ["scanned_pages_present"],
           },
         },
       }),
@@ -9538,4 +9607,4 @@ applyServiceMetadata(routes);
 export { routes };
 
 /** Every route router, in NetIntel's declaration order. */
-export const routers = [dnsRouter, sslRouter, sslCertQuickRouter, subnetRouter, redirectRouter, securityHeadersRouter, emailAuthRouter, cloudFingerprintRouter, schemaParseRouter, classifyRouter, messagesRouter, aiImageAssetsRouter, openaiGpt4oRouter, openaiGpt41Router, openaiGpt41MiniRouter, openaiGpt4oMiniRouter, openaiGpt41NanoRouter, openaiGpt55Router, openaiGpt54Router, openaiGpt54MiniRouter, openaiGpt54NanoRouter, openaiGpt51Router, openaiGpt5NanoRouter, v1OpenAiCompatRouter, v1EmbeddingsRouter, embeddingsLocalRouter, semanticRankRouter, openaiGpt52Router, openaiGpt56SolRouter, openaiGpt56TerraRouter, openaiGpt56LunaRouter, contentModerateRouter, entityExtractRouter, extractAddressRouter, extractContactRouter, extractInvoiceRouter, extractResumeRouter, extractTableRouter, markdownCleanRouter, normalizeJsonRouter, textToJsonRouter, sentimentRouter, textSummarizeRouter, textChunkRouter, textStatsRouter, translateLongRouter, translateShortRouter, translateStructuredRouter, translateBatchRouter, asnLookupRouter, whoisRdapRouter, certTransparencyRouter, dnsPropagationRouter, dnssecRouter, ipBlacklistRouter, techFingerprintRouter, breachCheckRouter, domainAvailabilityRouter, emailIntelRouter, emailVerifyRouter, ogScraperRouter, pageExtractRouter, webExtractRouter, webFetchRouter, exaSearchRouter, exaContentsRouter, exaAnswerRouter, phoneIntelRouter, robotsTxtRouter, rssParserRouter, usernameCheckRouter, waybackRouter, ipReputationRouter, cronParserRouter, currencyExchangeRouter, cryptoMarketRouter, gasPriceRouter, cryptoPriceRouter, cryptoOhlcRouter, currencyBatchRouter, currencyHistoryRouter, tokenInfoRouter, walletBalanceRouter, walletIntelRouter, ibanValidateRouter, marketSnapshotRouter, convertRouter, moneyParseRouter, jsonRepairRouter, schemaValidateRouter, schemaMapRouter, calendarIcsRouter, eventClassifyRouter, eventExtractRouter, githubIntelRouter, holidaysRouter, ipGeoRouter, weatherCurrentRouter, weatherForecastRouter, predictionMarketsRouter, predictionMarketRouter, jwtInspectorRouter, langDetectRouter, npmIntelRouter, sitemapParserRouter, urlSafetyRouter, bulkDomainRouter, domainAgeRouter, domainAppraiseRouter, domainReportRouter, ipRiskRouter, nameGenRouter, tldPriceRouter, typosquatRouter, domainDueDiligenceRouter, domainReportFullRouter, emailReportFullRouter, ipReportFullRouter, urlSafetyFullRouter, domainVendorRiskRouter, domainVetRouter];
+export const routers = [dnsRouter, sslRouter, sslCertQuickRouter, subnetRouter, redirectRouter, securityHeadersRouter, emailAuthRouter, cloudFingerprintRouter, schemaParseRouter, classifyRouter, messagesRouter, aiImageAssetsRouter, openaiGpt4oRouter, openaiGpt41Router, openaiGpt41MiniRouter, openaiGpt4oMiniRouter, openaiGpt41NanoRouter, openaiGpt55Router, openaiGpt54Router, openaiGpt54MiniRouter, openaiGpt54NanoRouter, openaiGpt51Router, openaiGpt5NanoRouter, v1OpenAiCompatRouter, v1EmbeddingsRouter, embeddingsLocalRouter, semanticRankRouter, openaiGpt52Router, openaiGpt56SolRouter, openaiGpt56TerraRouter, openaiGpt56LunaRouter, contentModerateRouter, entityExtractRouter, extractAddressRouter, extractContactRouter, extractInvoiceRouter, pdfParseRouter, extractResumeRouter, extractTableRouter, markdownCleanRouter, normalizeJsonRouter, textToJsonRouter, sentimentRouter, textSummarizeRouter, textChunkRouter, textStatsRouter, translateLongRouter, translateShortRouter, translateStructuredRouter, translateBatchRouter, asnLookupRouter, whoisRdapRouter, certTransparencyRouter, dnsPropagationRouter, dnssecRouter, ipBlacklistRouter, techFingerprintRouter, breachCheckRouter, domainAvailabilityRouter, emailIntelRouter, emailVerifyRouter, ogScraperRouter, pageExtractRouter, webExtractRouter, webFetchRouter, exaSearchRouter, exaContentsRouter, exaAnswerRouter, phoneIntelRouter, robotsTxtRouter, rssParserRouter, usernameCheckRouter, waybackRouter, ipReputationRouter, cronParserRouter, currencyExchangeRouter, cryptoMarketRouter, gasPriceRouter, cryptoPriceRouter, cryptoOhlcRouter, currencyBatchRouter, currencyHistoryRouter, tokenInfoRouter, walletBalanceRouter, walletIntelRouter, ibanValidateRouter, marketSnapshotRouter, convertRouter, moneyParseRouter, jsonRepairRouter, schemaValidateRouter, schemaMapRouter, calendarIcsRouter, eventClassifyRouter, eventExtractRouter, githubIntelRouter, holidaysRouter, ipGeoRouter, weatherCurrentRouter, weatherForecastRouter, predictionMarketsRouter, predictionMarketRouter, jwtInspectorRouter, langDetectRouter, npmIntelRouter, sitemapParserRouter, urlSafetyRouter, bulkDomainRouter, domainAgeRouter, domainAppraiseRouter, domainReportRouter, ipRiskRouter, nameGenRouter, tldPriceRouter, typosquatRouter, domainDueDiligenceRouter, domainReportFullRouter, emailReportFullRouter, ipReportFullRouter, urlSafetyFullRouter, domainVendorRiskRouter, domainVetRouter];
