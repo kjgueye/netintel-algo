@@ -4,7 +4,8 @@ import tls from "node:tls";
 import { timeouts } from "../config.js";
 import { rdapServerForTld } from "../utils/rdap-servers.js";
 import { checkSsrf, validateDomain, ValidationError } from "../utils/validators.js";
-import { isDnsblListing, queryDns, resolveTxt } from "../utils/dns-resolvers.js";
+import { isDnsblListing, nsPresence, queryDns, resolveTxt } from "../utils/dns-resolvers.js";
+import { classifySectionFailure, sectionFailure, type SectionFailure } from "../utils/section-failure.js";
 import { safeFetch } from "../utils/safe-fetch.js";
 
 export const domainReportRouter = Router();
@@ -18,6 +19,8 @@ interface Finding {
 }
 
 interface WhoisSection {
+  error?: SectionFailure["error"];
+  detail?: string;
   available: boolean;
   registrar: string | null;
   created_at: string | null;
@@ -27,6 +30,8 @@ interface WhoisSection {
 }
 
 interface DnsSection {
+  error?: SectionFailure["error"];
+  detail?: string;
   available: boolean;
   a_records: string[];
   mx_records: string[];
@@ -35,6 +40,8 @@ interface DnsSection {
 }
 
 interface SslSection {
+  error?: SectionFailure["error"];
+  detail?: string;
   available: boolean;
   issuer: string | null;
   valid_from: string | null;
@@ -44,6 +51,8 @@ interface SslSection {
 }
 
 interface TechSection {
+  error?: SectionFailure["error"];
+  detail?: string;
   available: boolean;
   server: string | null;
   cdn: string | null;
@@ -52,6 +61,8 @@ interface TechSection {
 }
 
 interface BlacklistSection {
+  error?: SectionFailure["error"];
+  detail?: string;
   available: boolean;
   listed_count: number;
   lists_checked: number;
@@ -92,6 +103,19 @@ function daysBetween(from: Date, to: Date): number {
 
 function reverseIp(ip: string): string {
   return ip.split(".").reverse().join(".");
+}
+
+/** A section sentinel plus the classified reason it is empty. */
+function unavailable<T extends { available: boolean }>(empty: T, failure: SectionFailure): T {
+  return { ...empty, error: failure.error, detail: failure.detail };
+}
+function unavailableFrom<T extends { available: boolean }>(empty: T, reason: unknown): T {
+  return unavailable(empty, classifySectionFailure(reason));
+}
+
+/** `{ error, detail }` for a failed section, nothing for a healthy one. */
+function reason(section: { available: boolean; error?: string; detail?: string }): { error?: string; detail?: string } {
+  return section.available ? {} : { error: section.error, detail: section.detail };
 }
 
 function settledValue<T>(result: PromiseSettledResult<T>, fallback: T): T {
@@ -156,19 +180,22 @@ async function whoisCheck(domain: string): Promise<WhoisSection> {
     const bootstrapRes = await fetch("https://data.iana.org/rdap/dns.json", {
       signal: AbortSignal.timeout(timeouts.domainReport),
     });
-    if (!bootstrapRes.ok) return WHOIS_EMPTY;
+    if (!bootstrapRes.ok) return unavailable(WHOIS_EMPTY, sectionFailure("upstream_http_error", `IANA RDAP bootstrap returned ${bootstrapRes.status}`));
     const bootstrap = (await bootstrapRes.json()) as { services: string[][][] };
 
     // IANA bootstrap first, then the supplemental ccTLD map (utils/rdap-servers.ts).
     const rdapBaseUrl = rdapServerForTld(bootstrap, tld);
-    if (!rdapBaseUrl) return WHOIS_EMPTY;
+    if (!rdapBaseUrl) {
+      return unavailable(WHOIS_EMPTY, sectionFailure("unsupported_tld", `no public RDAP service exists for .${tld} — registration data cannot be fetched`));
+    }
 
     await checkSsrf(new URL(rdapBaseUrl).hostname);
 
     const rdapRes = await fetch(`${rdapBaseUrl}/domain/${domain}`, {
       signal: AbortSignal.timeout(timeouts.domainReport),
     });
-    if (!rdapRes.ok) return WHOIS_EMPTY;
+    if (rdapRes.status === 404) return unavailable(WHOIS_EMPTY, sectionFailure("not_found", `the .${tld} registry has no RDAP record for ${domain}`));
+    if (!rdapRes.ok) return unavailable(WHOIS_EMPTY, sectionFailure("upstream_http_error", `RDAP server returned ${rdapRes.status}`));
     const data = (await rdapRes.json()) as Record<string, unknown>;
 
     const dates = extractEvents(data.events);
@@ -184,8 +211,8 @@ async function whoisCheck(domain: string): Promise<WhoisSection> {
       days_until_expiry: daysUntilExpiry,
       status: extractStatus(data.status),
     };
-  } catch {
-    return WHOIS_EMPTY;
+  } catch (err) {
+    return unavailableFrom(WHOIS_EMPTY, err);
   }
 }
 
@@ -215,8 +242,8 @@ async function dnsCheck(domain: string): Promise<DnsSection> {
       ns_records: nsAnswers.map((a) => (a.ns || "").replace(/\.$/, "")).filter(Boolean),
       txt_records: txtRecords,
     };
-  } catch {
-    return DNS_EMPTY;
+  } catch (err) {
+    return unavailableFrom(DNS_EMPTY, err);
   }
 }
 
@@ -265,7 +292,7 @@ async function sslCheck(domain: string): Promise<SslSection> {
   try {
     await checkSsrf(domain);
     const cert = await tlsConnect(domain, 443);
-    if (!cert || !cert.valid_to) return SSL_EMPTY;
+    if (!cert || !cert.valid_to) return unavailable(SSL_EMPTY, sectionFailure("tls_failed", "the server completed the handshake but presented no certificate"));
 
     const validTo = new Date(cert.valid_to);
     const daysUntilExpiry = isNaN(validTo.getTime()) ? null : daysBetween(new Date(), validTo);
@@ -290,8 +317,8 @@ async function sslCheck(domain: string): Promise<SslSection> {
       days_until_expiry: daysUntilExpiry,
       san_count: sanCount,
     };
-  } catch {
-    return SSL_EMPTY;
+  } catch (err) {
+    return unavailableFrom(SSL_EMPTY, err);
   }
 }
 
@@ -351,8 +378,8 @@ async function techCheck(domain: string): Promise<TechSection> {
       cms: detectCms(html),
       waf: detectWaf(res.headers),
     };
-  } catch {
-    return TECH_EMPTY;
+  } catch (err) {
+    return unavailableFrom(TECH_EMPTY, err);
   }
 }
 
@@ -369,7 +396,7 @@ async function blacklistCheck(domain: string): Promise<BlacklistSection> {
   try {
     const aAnswers = await queryDns(domain, "A");
     const ip = aAnswers.map((a) => a.address!).filter(Boolean)[0];
-    if (!ip || !net.isIPv4(ip)) return BLACKLIST_EMPTY;
+    if (!ip || !net.isIPv4(ip)) return unavailable(BLACKLIST_EMPTY, sectionFailure("dns_unresolvable", "no IPv4 A record to check against the blocklists"));
 
     const reversed = reverseIp(ip);
     const results = await Promise.allSettled(
@@ -393,8 +420,8 @@ async function blacklistCheck(domain: string): Promise<BlacklistSection> {
       lists_checked: DNSBLS.length,
       listed_on: listedOn,
     };
-  } catch {
-    return BLACKLIST_EMPTY;
+  } catch (err) {
+    return unavailableFrom(BLACKLIST_EMPTY, err);
   }
 }
 
@@ -412,6 +439,21 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
 
     const domain = validateDomain(rawDomain);
 
+    // A name that does not exist in DNS has nothing to report on. Before
+    // 2026-10-11 it produced a billed report with `dns.available: true`, four
+    // empty arrays and a D grade built from "no MX", "no SPF", "no SSL" —
+    // findings about a domain that does not exist. 422 → nothing is settled.
+    const presence = await nsPresence(domain, timeouts.domainReport);
+    if (presence === "available") {
+      res.status(422).json({
+        error: `${domain} does not exist in DNS (NXDOMAIN) — there is nothing to report on. You were not charged.`,
+        code: "NXDOMAIN",
+        domain,
+        dns: { status: "nxdomain" },
+      });
+      return;
+    }
+
     // All five checks run concurrently — a slow or failing check never blocks the others.
     const [whoisR, dnsR, sslR, techR, blacklistR] = await Promise.allSettled([
       whoisCheck(domain),
@@ -421,11 +463,22 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
       blacklistCheck(domain),
     ]);
 
-    const whois = settledValue(whoisR, WHOIS_EMPTY);
-    const dns = settledValue(dnsR, DNS_EMPTY);
-    const ssl = settledValue(sslR, SSL_EMPTY);
-    const tech = settledValue(techR, TECH_EMPTY);
-    const blacklist = settledValue(blacklistR, BLACKLIST_EMPTY);
+    // Each check already classifies its own failure; a rejection that escaped
+    // one (should not happen) is classified here so no section is ever a bare
+    // `available: false` with no reason.
+    const settledOr = <T extends { available: boolean }>(r: PromiseSettledResult<T>, empty: T): T =>
+      r.status === "fulfilled" ? r.value : unavailableFrom(empty, r.reason);
+    const whois = settledOr(whoisR, WHOIS_EMPTY);
+    let dns = settledOr(dnsR, DNS_EMPTY);
+    const ssl = settledOr(sslR, SSL_EMPTY);
+    const tech = settledOr(techR, TECH_EMPTY);
+    const blacklist = settledOr(blacklistR, BLACKLIST_EMPTY);
+
+    // SERVFAIL (lame or broken delegation) resolves nothing but the name does
+    // exist: say that, instead of "resolved with no records".
+    if (dns.available && presence === "servfail" && dns.a_records.length === 0 && dns.ns_records.length === 0) {
+      dns = unavailable(DNS_EMPTY, sectionFailure("dns_unresolvable", "the authoritative nameservers answered SERVFAIL — the name exists but does not resolve"));
+    }
 
     // --- Aggregate risk scoring across all five dimensions ---
     let score = 100;
@@ -437,7 +490,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
 
     // WHOIS
     if (!whois.available) {
-      deduct("whois_unavailable", 10, "WHOIS/RDAP registration data unavailable");
+      deduct("whois_unavailable", 10, `WHOIS/RDAP registration data unavailable (${whois.error}: ${whois.detail})`);
     } else {
       if (whois.days_until_expiry !== null && whois.days_until_expiry < 30) {
         deduct("domain_expiring_soon", 20, `Domain expires in ${whois.days_until_expiry} days`);
@@ -452,7 +505,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
 
     // SSL
     if (!ssl.available) {
-      deduct("ssl_missing", 25, "SSL certificate could not be retrieved");
+      deduct("ssl_missing", 25, `SSL certificate could not be retrieved (${ssl.error}: ${ssl.detail})`);
     } else if (ssl.days_until_expiry !== null && ssl.days_until_expiry < 14) {
       deduct("ssl_expiring_soon", 20, `SSL certificate expires in ${ssl.days_until_expiry} days`);
     }
@@ -487,6 +540,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
       sections: {
         whois: {
           available: whois.available,
+          ...reason(whois),
           registrar: whois.registrar,
           created_at: whois.created_at,
           expires_at: whois.expires_at,
@@ -495,6 +549,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
         },
         dns: {
           available: dns.available,
+          ...reason(dns),
           a_records: dns.a_records,
           mx_records: dns.mx_records,
           ns_records: dns.ns_records,
@@ -502,6 +557,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
         },
         ssl: {
           available: ssl.available,
+          ...reason(ssl),
           issuer: ssl.issuer,
           valid_from: ssl.valid_from,
           valid_to: ssl.valid_to,
@@ -510,6 +566,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
         },
         tech: {
           available: tech.available,
+          ...reason(tech),
           server: tech.server,
           cdn: tech.cdn,
           cms: tech.cms,
@@ -517,6 +574,7 @@ domainReportRouter.get("/domain-report/analyze", async (req: Request, res: Respo
         },
         blacklist: {
           available: blacklist.available,
+          ...reason(blacklist),
           listed_count: blacklist.listed_count,
           lists_checked: blacklist.lists_checked,
           listed_on: blacklist.listed_on,

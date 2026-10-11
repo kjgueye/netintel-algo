@@ -2,7 +2,8 @@ import { Router, type Request, type Response } from "express";
 import { validateDomain, ValidationError } from "../utils/validators.js";
 import { timeouts } from "../config.js";
 import { runDnsLookup } from "./dns.js";
-import { deliverableMxHosts } from "../utils/dns-resolvers.js";
+import { deliverableMxHosts, nsPresence } from "../utils/dns-resolvers.js";
+import { classifySectionFailure, type SectionFailure } from "../utils/section-failure.js";
 import { runSslAnalyze } from "./ssl.js";
 import { runWhoisRdap } from "./whois-rdap.js";
 import { runCloudFingerprint } from "./cloud-fingerprint.js";
@@ -23,8 +24,8 @@ interface Finding {
 
 /** Sentinel so a per-sub-service timeout is distinguishable from any other failure. */
 class TimeoutError extends Error {
-  constructor() {
-    super("timeout");
+  constructor(ms: number) {
+    super(`no answer within ${ms} ms`);
     this.name = "TimeoutError";
   }
 }
@@ -37,7 +38,7 @@ class TimeoutError extends Error {
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   const deadline = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new TimeoutError()), ms);
+    timer = setTimeout(() => reject(new TimeoutError(ms)), ms);
   });
   return Promise.race([p.finally(() => clearTimeout(timer)), deadline]);
 }
@@ -50,11 +51,9 @@ function calculateGrade(score: number): string {
   return "F";
 }
 
-/** Map a rejection reason to the standard failed-section error string. */
-function errorOf(reason: unknown): "timeout" | "upstream_error" | "internal_error" {
-  if (reason instanceof TimeoutError) return "timeout";
-  if (reason instanceof Error) return "upstream_error";
-  return "internal_error";
+/** The standard failed-section shape: a closed error code plus the short reason. */
+function failed(r: PromiseSettledResult<unknown>): SectionFailure {
+  return classifySectionFailure((r as PromiseRejectedResult).reason);
 }
 
 function daysUntil(dateStr: string | null | undefined): number | null {
@@ -75,11 +74,25 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
     }
 
     const domain = validateDomain(rawDomain);
+    const timeout = timeouts.domainReportFull;
+
+    // A name that does not exist in DNS has nothing to report on. Before
+    // 2026-10-11 it produced a billed report with `dns.available: true`, four
+    // empty arrays, five "upstream_error" sections and a C grade (a real $0.25
+    // call for a mistyped council domain). 422 → nothing is settled.
+    if ((await nsPresence(domain, timeout)) === "available") {
+      res.status(422).json({
+        error: `${domain} does not exist in DNS (NXDOMAIN) — there is nothing to report on. You were not charged.`,
+        code: "NXDOMAIN",
+        domain,
+        dns: { status: "nxdomain" },
+      });
+      return;
+    }
 
     // All six sub-services run concurrently, each under its own per-sub-service
     // deadline. A slow or failing sub-service degrades to a failed section,
     // never a 500.
-    const timeout = timeouts.domainReportFull;
     const [dnsR, sslR, whoisR, cloudR, techR, secR] = await Promise.allSettled([
       withTimeout(runDnsLookup(domain), timeout),
       withTimeout(runSslAnalyze(domain), timeout),
@@ -109,7 +122,7 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
           ns_records: dnsData!.records.NS,
           txt_records: dnsData!.records.TXT,
         }
-      : { available: false, error: errorOf((dnsR as PromiseRejectedResult).reason) };
+      : failed(dnsR);
 
     const sslData = sslOk ? sslR.value : null;
     const sslDaysUntilExpiry = sslOk ? daysUntil(sslData!.certificate.not_after) : null;
@@ -122,7 +135,7 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
           valid_to: sslData!.certificate.not_after,
           days_until_expiry: sslDaysUntilExpiry,
         }
-      : { available: false, error: errorOf((sslR as PromiseRejectedResult).reason) };
+      : failed(sslR);
 
     const whoisData = whoisOk ? whoisR.value : null;
     const whois = whoisOk
@@ -133,7 +146,7 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
           expires_at: whoisData!.expires_at,
           days_until_expiry: whoisData!.days_until_expiry,
         }
-      : { available: false, error: errorOf((whoisR as PromiseRejectedResult).reason) };
+      : failed(whoisR);
 
     const cloudData = cloudOk ? cloudR.value : null;
     const cloud = cloudOk
@@ -144,7 +157,7 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
           dns_provider: cloudData!.dns_provider.provider,
           grade: cloudData!.grade,
         }
-      : { available: false, error: errorOf((cloudR as PromiseRejectedResult).reason) };
+      : failed(cloudR);
 
     const techData = techOk ? techR.value : null;
     const tech = techOk
@@ -155,7 +168,7 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
           cms: techData!.cms,
           waf: techData!.waf,
         }
-      : { available: false, error: errorOf((techR as PromiseRejectedResult).reason) };
+      : failed(techR);
 
     const secData = secOk ? secR.value : null;
     const security_headers = secOk
@@ -165,7 +178,7 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
           hsts: secData!.hsts_present,
           csp: secData!.csp_present,
         }
-      : { available: false, error: errorOf((secR as PromiseRejectedResult).reason) };
+      : failed(secR);
 
     const oks = [dnsOk, sslOk, whoisOk, cloudOk, techOk, secOk];
     const sectionsOk = oks.filter(Boolean).length;
@@ -190,8 +203,8 @@ domainReportFullRouter.get("/domain-report/full", async (req: Request, res: Resp
     ];
     for (const [name, ok, settled] of sectionStatus) {
       if (!ok) {
-        const err = errorOf((settled as PromiseRejectedResult).reason);
-        findings.push({ rule: "section_failed", deduction: 0, detail: `${name}: ${err}` });
+        const f = failed(settled);
+        findings.push({ rule: "section_failed", deduction: 0, detail: `${name}: ${f.error} — ${f.detail}` });
       }
     }
 
