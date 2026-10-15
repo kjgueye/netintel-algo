@@ -973,7 +973,7 @@ const weatherCurrentBase = {
   // Keep under ~450 chars — oversized discovery blobs are echoed into the
   // paymentPayload and CDP rejects settlement. See memory x402-paymentpayload-size-limit.
   description:
-    "Live weather + 3-day forecast for any city or lat/lon worldwide — temperature, feels-like, humidity, wind, precipitation, cloud cover, and a plain-language condition. Give a city name (geocoded for you) or coordinates. No API key, metric or imperial units. Pass params as query (GET) or a JSON body (POST).",
+    "Current weather for any city or lat/lon worldwide, plus a 3-day forecast — temperature, feels-like, humidity, wind, precipitation, cloud cover, and a plain-language condition. Give a city name (geocoded for you) or coordinates. No API key, metric or imperial units. Pass params as query (GET) or a JSON body (POST).",
   mimeType: "application/json",
 };
 const weatherCurrentOutput = {
@@ -1272,7 +1272,7 @@ const predictionMarketsBase = {
   // Keep under ~450 chars — oversized discovery blobs are echoed into the
   // paymentPayload and CDP rejects settlement. See memory x402-paymentpayload-size-limit.
   description:
-    "Live prediction-market odds from Polymarket — list the top active markets by volume, or search by keyword. Each result has the question, outcomes with current prices (implied probabilities), 24h/total volume, liquidity, and resolution date. No API key. Great for agents tracking real-world event probabilities (elections, crypto, sports, econ). Pass params as query (GET) or a JSON body (POST).",
+    "Live prediction market odds from Polymarket — list the top active markets by volume, or search by keyword. Each result has the question, outcomes with current prices (implied probabilities), 24h/total volume, liquidity, and resolution date. No API key. Great for agents tracking real-world event probabilities (elections, crypto, sports, econ). Pass params as query (GET) or a JSON body (POST).",
   mimeType: "application/json",
 };
 const predictionMarketsOutput = {
@@ -2190,7 +2190,7 @@ const routes = {
   "POST /messages": {
     accepts: paidAccepts(pricing.messages),
     description:
-      "OpenAI-compatible chat completions over x402, answered by Claude Sonnet 4.6 — send a messages array and get an assistant reply for Q&A, reasoning, agent planning, coding help, summarization, extraction, and classification. Body is OpenAI chat.completions-shaped ({model?, messages:[{role,content}], max_tokens?, temperature?}); response is a chat.completion object. Flat $0.06; inputs capped ~6KB, max_tokens 1024; no streaming in v1.",
+      "OpenAI-compatible chat completions over x402, answered by Claude Sonnet 4.6 — send a messages array and get an assistant reply for Q&A, reasoning, agent planning, coding help, summarization, extraction, and classification. OpenAI chat.completions body and response. Vision: up to 4 https image_url parts. Flat $0.06; input ~24KB (each image counts 1,600 tokens), max_tokens 1024; no streaming.",
     mimeType: "application/json",
     extensions: {
       ...declareDiscoveryExtension({
@@ -2205,7 +2205,7 @@ const routes = {
             messages: {
               type: "array",
               description:
-                "Chat messages in OpenAI format. Each item is {role: 'system'|'user'|'assistant', content: string}. System messages are applied as the system prompt.",
+                "Chat messages in OpenAI format. Each item is {role: 'system'|'user'|'assistant', content: string}. System messages are applied as the system prompt. User content may also be an array of {type:'text',text} and up to 4 {type:'image_url',image_url:{url:'https://…'}} parts (JPEG/PNG/GIF/WebP).",
               items: {
                 type: "object",
                 properties: {
@@ -4598,7 +4598,7 @@ const routes = {
   "POST /text-summarize": {
     accepts: paidAccepts(pricing.textSummarize),
     description:
-      "Text summarizer / summarization API — condense text, Markdown, or a URL into a TL;DR plus key bullet points using Claude Haiku. Accepts raw text or a URL (fetched and extracted), enforces an input cap, and returns a clean structured summary so agents can compress documents and articles in one call.",
+      "Summarize text, articles or documents — condense raw text, Markdown, or a URL into a TL;DR plus key bullet points. Accepts raw text or a URL (fetched and extracted), enforces an input cap, and returns a clean structured summary so agents can compress documents and articles in one call.",
     mimeType: "application/json",
     extensions: {
       ...declareDiscoveryExtension({
@@ -5208,7 +5208,7 @@ const routes = {
   "GET /whois-rdap/lookup": {
     accepts: paidAccepts(pricing.whoisRdap),
     description:
-      "Domain registration lookup, WHOIS via RDAP — registrar, registration and expiry dates, last-updated date, nameservers, and status flags from the authoritative registry, plus an actionability score so agents can assess domain trustworthiness, ownership, or availability risk.",
+      "WHOIS domain lookup via RDAP — domain registration data: registrar, registration and expiry dates, last-updated date, nameservers, and status flags from the authoritative registry, plus an actionability score so agents can assess domain trustworthiness, ownership, or availability risk.",
     mimeType: "application/json",
     extensions: {
       ...declareDiscoveryExtension({
@@ -6413,7 +6413,7 @@ const routes = {
     // Keep under ~450 chars — oversized discovery blobs are echoed into the
     // paymentPayload and CDP rejects settlement. See memory x402-paymentpayload-size-limit.
     description:
-      "Native + USDC + custom-token balances for any wallet on Base, Ethereum, or Solana — with USD estimates — straight from public RPCs, no API key. Raw units as decimal strings plus formatted numbers; add up to 10 ERC-20 contracts via tokens=. 60s cache; an empty, never-used address is a real answer (zeros + no_activity_detected finding).",
+      "Token balance for any wallet — native coin, USDC and any ERC-20 on Base, Ethereum, or Solana, with USD estimates — straight from public RPCs, no API key. Raw units as decimal strings plus formatted numbers; add up to 10 ERC-20 contracts via tokens=. 60s cache; an empty, never-used address is a real answer (zeros + no_activity_detected finding).",
     mimeType: "application/json",
     extensions: {
       ...declareDiscoveryExtension({
@@ -7719,7 +7719,7 @@ const routes = {
   "GET /web/extract": {
     accepts: paidAccepts(pricing.webExtract),
     description:
-      "Extract text from a web page or PDF as clean Markdown — HTML to Markdown for any URL: strips scripts, nav, ads, and boilerplate while preserving headings, links, lists, tables, code blocks, and blockquotes; extracts the text layer from PDFs. Returns Markdown body, title, word count, and a quality grade. Web scraper / reader for article and main content. For JS-rendered or bot-walled pages a plain fetch can't read, use /exa/contents.",
+      "Extract web content from any page or PDF as clean Markdown — web page text, HTML to Markdown for any URL: strips scripts, nav, ads, and boilerplate while preserving headings, links, lists, tables, code blocks, and blockquotes; extracts the text layer from PDFs. Returns Markdown body, title, word count, and a quality grade. Web reader for article and main content. For JS-rendered or bot-walled pages a plain fetch can't read, use /exa/contents.",
     mimeType: "application/json",
     extensions: {
       ...declareDiscoveryExtension({

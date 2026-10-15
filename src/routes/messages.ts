@@ -5,6 +5,7 @@ import { config, pricing, timeouts } from "../config.js";
 import { ValidationError } from "../utils/validators.js";
 import { signableAccepts } from "../accepts.js";
 import { estimateTokens, tokenBudgetForCharCap, tokenDensityMessage } from "../utils/token-estimate.js";
+import { validateImageUrl } from "../services/openai-vision.js";
 
 // OpenAI-compatible chat endpoint over x402, served by Claude. The request body
 // is OpenAI chat.completions-shaped; we translate to the Anthropic Messages API,
@@ -26,6 +27,17 @@ import { estimateTokens, tokenBudgetForCharCap, tokenDensityMessage } from "../u
 //   24k chars of CJK (~$0.072 input alone) would exceed the flat price.
 //   Adding a model — or raising the input cap further — means re-checking that the
 //   flat price still covers its rates at the new ceiling.
+//
+// Images (since 2026-10-14): up to MAX_IMAGES https image URLs in user messages,
+// as OpenAI image_url parts or Anthropic-native {type:"image",source:{type:"url"}}
+// blocks. Anthropic fetches the URL (no bytes transit Railway, no SSRF surface on
+// our side). Sonnet 4.6 is on the STANDARD resolution tier: every image is
+// downscaled to <= 1568 visual tokens (platform docs, "Resolution and token
+// cost"), so each image is reserved at IMAGE_RESERVE_TOKENS and the reserves
+// count against the SAME input token budget as text. The worst-case input is
+// therefore unchanged and the flat price needs no change. Before this, image
+// parts were silently dropped and Claude answered "what's in this image?"
+// blind — on a 200 we charged for (catalog-evaluator wallet, 2026-10).
 
 export const messagesRouter = Router();
 
@@ -71,12 +83,81 @@ export function clampMaxTokens(input: unknown): number {
   return Math.min(HARD_MAX_TOKENS, Math.floor(n));
 }
 
+// Sonnet 4.6 standard tier caps an image at 1568 visual tokens; reserve a
+// little above it for the block framing.
+export const IMAGE_RESERVE_TOKENS = 1600;
+export const MAX_IMAGES = 4;
+const MAX_IMAGE_URL_CHARS = 2048;
+
 function contentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content.map((p: any) => (typeof p?.text === "string" ? p.text : "")).join(" ");
   }
   return "";
+}
+
+/** The caller-supplied URL if this part is an image (OpenAI or Anthropic shape), else undefined. */
+function imagePartUrl(p: any, where: string): string | undefined {
+  if (p?.type === "image_url") {
+    const iu = p.image_url;
+    // OpenAI allows image_url as a bare string in some SDKs; accept both.
+    return typeof iu === "string" ? iu : iu?.url;
+  }
+  if (p?.type === "image") {
+    if (p.source?.type !== "url") {
+      throw new ValidationError(
+        `${where}: only {"type":"url"} image sources are accepted — host the image at an https URL.`,
+      );
+    }
+    return p.source.url;
+  }
+  return undefined;
+}
+
+/**
+ * One message's content as Anthropic content. Text-only content stays a plain
+ * string (unchanged behaviour); content with images becomes text + image
+ * blocks in the caller's order. Parts that are neither text nor an image are
+ * REFUSED rather than dropped — a silently dropped part is how the model came
+ * to answer image questions without the image.
+ */
+function toAnthropicContent(
+  content: unknown,
+  role: string,
+  where: string,
+): { content: string | Anthropic.ContentBlockParam[]; text: string; images: number } {
+  if (!Array.isArray(content)) {
+    const text = contentToText(content);
+    return { content: text, text, images: 0 };
+  }
+  const blocks: Anthropic.ContentBlockParam[] = [];
+  const texts: string[] = [];
+  let images = 0;
+  content.forEach((p: any, j: number) => {
+    const at = `${where}.content[${j}]`;
+    if (typeof p?.text === "string") {
+      texts.push(p.text);
+      if (p.text) blocks.push({ type: "text", text: p.text });
+      return;
+    }
+    const raw = imagePartUrl(p, at);
+    if (raw === undefined) {
+      const label = typeof p?.type === "string" ? `'${p.type.slice(0, 40)}'` : "unknown";
+      throw new ValidationError(
+        `${at}: content part type ${label} is not supported. Send text parts or up to ${MAX_IMAGES} https ` +
+          '{"type":"image_url","image_url":{"url":"https://…"}} parts; audio and file parts are not accepted.',
+      );
+    }
+    if (role !== "user") {
+      throw new ValidationError(`${at}: images are only accepted in user messages (this message has role "${role}").`);
+    }
+    const url = validateImageUrl(raw, MAX_IMAGE_URL_CHARS, at);
+    blocks.push({ type: "image", source: { type: "url", url } });
+    images++;
+  });
+  const text = texts.join(" ");
+  return { content: images > 0 ? blocks : text, text, images };
 }
 
 // --- Translation: OpenAI <-> Anthropic -------------------------------------
@@ -103,27 +184,38 @@ export function toAnthropicMessages(rawMessages: any[]): {
   system?: string;
   messages: Anthropic.MessageParam[];
   chars: number;
+  images: number;
 } {
   const systemParts: string[] = [];
   const messages: Anthropic.MessageParam[] = [];
   let chars = 0;
-  for (const m of rawMessages) {
+  let images = 0;
+  rawMessages.forEach((m, i) => {
     const role = m?.role;
-    const text = contentToText(m?.content);
+    // Unrecognized roles become user turns (below), so they may carry images too.
+    const effectiveRole = role === "system" || role === "assistant" ? role : "user";
+    const converted = toAnthropicContent(m?.content, effectiveRole, `messages[${i}]`);
+    const text = converted.text;
     chars += text.length;
+    images += converted.images;
+    if (images > MAX_IMAGES) {
+      throw new ValidationError(
+        `Too many images: more than ${MAX_IMAGES} across the request (duplicates count). Send at most ${MAX_IMAGES} per call.`,
+      );
+    }
     if (role === "system") {
       if (text) systemParts.push(text);
     } else if (role === "assistant") {
       messages.push({ role: "assistant", content: text });
     } else {
-      // user, or any unrecognized role, becomes a user turn
-      messages.push({ role: "user", content: text });
+      messages.push({ role: "user", content: converted.content });
     }
-  }
+  });
   return {
     system: systemParts.length ? systemParts.join("\n\n") : undefined,
     messages,
     chars,
+    images,
   };
 }
 
@@ -167,7 +259,7 @@ messagesRouter.post("/messages", async (req: Request, res: Response) => {
     }
 
     const maxTokens = clampMaxTokens(body.max_tokens);
-    const { system, messages, chars } = toAnthropicMessages(body.messages);
+    const { system, messages, chars, images } = toAnthropicMessages(body.messages);
     if (messages.length === 0) {
       throw new ValidationError("At least one user or assistant message is required");
     }
@@ -181,6 +273,14 @@ messagesRouter.post("/messages", async (req: Request, res: Response) => {
     // flat price by itself. Enforce the token budget the price was derived for.
     const inTokenBudget = tokenBudgetForCharCap(MAX_INPUT_CHARS);
     const estTokens = estimateTokens(body.messages.map((m: any) => contentToText(m?.content)).join(" "));
+    // Images share the same budget, each reserved at its documented maximum.
+    const imageTokens = images * IMAGE_RESERVE_TOKENS;
+    if (images > 0 && estTokens + imageTokens > inTokenBudget) {
+      throw new ValidationError(
+        `Input too large: ~${estTokens} estimated text tokens + ${images} image(s) reserved at ${IMAGE_RESERVE_TOKENS} each ` +
+          `= ~${estTokens + imageTokens} tokens (max ${inTokenBudget}). Send fewer images or shorten the text.`,
+      );
+    }
     if (estTokens > inTokenBudget) {
       throw new ValidationError(tokenDensityMessage(estTokens, inTokenBudget));
     }
@@ -211,6 +311,18 @@ messagesRouter.post("/messages", async (req: Request, res: Response) => {
         { signal: controller.signal },
       );
     } catch (err) {
+      // An image Anthropic could not fetch or decode (404, non-image, too big)
+      // is the caller's input problem: say so with an uncharged 400 instead of
+      // a generic upstream 502.
+      if (images > 0 && err instanceof Anthropic.APIError && (err as { status?: unknown }).status === 400) {
+        res.status(400).json({
+          error: {
+            message: `Image could not be used: ${String(err.message).slice(0, 300)}. Check the URL is a public https JPEG, PNG, GIF or WebP.`,
+            type: "invalid_request_error",
+          },
+        });
+        return;
+      }
       // Our own abort surfaces from the SDK as APIUserAbortError (an APIError).
       if (
         err instanceof Anthropic.APIError ||

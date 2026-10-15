@@ -4,4 +4,4 @@ NetIntel (Base) repo; src/route-table.ts is generated from its src/index.ts.
 Do not hand-edit them — edits belong in src/config.ts, src/accepts.ts or
 src/index.ts, or upstream in NetIntel. Regenerate with: npm run sync:from-netintel
 
-netintel-commit: 40cc0fefc9ff2f9e48b9f4232636a7d61b3ff4a4
+netintel-commit: e045accc89082728c9bead342cc761e62ec12d8b
