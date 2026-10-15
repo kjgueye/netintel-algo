@@ -30,19 +30,32 @@ import { PAYMENT_HEADER_NAMES } from "./payment-headers.js";
 // The alias list lives in src/payment-headers.ts — one definition, so a new
 // alias can never be stripped here and honoured elsewhere (or vice versa).
 
+// The lookup key for a path. Express's default routing is case-insensitive and
+// non-strict, so HEAD /Subnet/Calc and HEAD /subnet/calc/ both reach the
+// .get("/subnet/calc") handler — and the x402 matcher prices them as that same
+// route. An exact `req.path` lookup told them apart: both spellings ran the
+// handler unpaid in production until 2026-10-14. Folding case and trailing
+// slashes is a superset of what Express matches (it allows only one trailing
+// slash), so every spelling that can reach a paid handler gets the challenge;
+// the extra ones it catches answer 402 where they used to 404.
+function matchKey(path: string): string {
+  return path.toLowerCase().replace(/(.+?)\/+$/, "$1");
+}
+
 export function headChallenge(routes: Record<string, unknown>, paywall: RequestHandler): RequestHandler {
   // Paid verb per path; GET wins when a path is registered under several verbs.
   const verbByPath = new Map<string, string>();
   for (const key of Object.keys(routes)) {
     const [verb, path] = key.split(" ");
     if (!verb || !path) continue;
-    const prev = verbByPath.get(path);
-    if (!prev || verb === "GET") verbByPath.set(path, verb);
+    const k = matchKey(path);
+    const prev = verbByPath.get(k);
+    if (!prev || verb === "GET") verbByPath.set(k, verb);
   }
 
   return (req: Request, res: Response, next: NextFunction): void => {
     if (req.method !== "HEAD") return next();
-    const verb = verbByPath.get(req.path);
+    const verb = verbByPath.get(matchKey(req.path));
     if (!verb) return next();
 
     const headers = { ...req.headers };
